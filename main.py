@@ -9,7 +9,7 @@ import threading
 # === CONFIG ===
 TICKER = "BTC-USD"
 INTERVAL = "15m"
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/PUT-YOUR-REAL-HOOK"
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1374711617127841922/U8kaZV_I_l1P6H6CFnBg6oWAFLnEUMLfiFpzq-DGM4GJrraRlYvHSHifboWqnYjkUYNR"
 FAST, SLOW, SIGNAL = 8, 15, 9
 CHECK_DELAY = 60  # seconds between checks
 
@@ -32,6 +32,11 @@ def send_alert(message: str):
     except Exception as e:
         print("Discord error:", e)
 
+def send_startup_ping():
+    msg = f"✅ Bot started and is monitoring {TICKER} ({INTERVAL}) — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    print(msg)
+    send_alert(msg)
+
 def get_data():
     df = yf.download(tickers=TICKER, interval=INTERVAL, period="2d")
     df.dropna(inplace=True)
@@ -47,6 +52,7 @@ def macd(df, fast=FAST, slow=SLOW, signal=SIGNAL):
 # === MAIN LOOP ===
 last_state = None
 print("🔄 Bot started... monitoring MACD zero-cross on", TICKER)
+send_startup_ping()
 
 while True:
     try:
