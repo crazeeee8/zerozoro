@@ -1,4 +1,7 @@
-yfinance
-pandas
 requests
+pandas>=1.5
+numpy
 flask
+mplfinance
+matplotlib
+
