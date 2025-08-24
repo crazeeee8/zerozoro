@@ -1,5 +1,5 @@
 requests
-pandas>=1.5
+pandas_ta
 numpy
 flask
 mplfinance
@@ -7,3 +7,4 @@ matplotlib
 python-binance
 ta
 pytz
+
