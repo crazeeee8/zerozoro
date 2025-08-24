@@ -1,5 +1,4 @@
 requests
-pandas_ta
 numpy
 flask
 mplfinance
@@ -8,5 +7,6 @@ python-binance
 ta
 pytz
 setuptools
+
 
 
