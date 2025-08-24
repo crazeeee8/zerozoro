@@ -6,6 +6,8 @@ import ccxt
 import asyncio
 import aiohttp
 from datetime import datetime, timezone, timedelta
+from flask import Flask
+import threading
 
 # ================= CONFIG =================
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
@@ -18,13 +20,23 @@ LOOKBACK = 100
 # Track last states to prevent duplicate alerts
 last_macd_state = {"early": None, "confirm": None}
 
+# ================= FLASK KEEP-ALIVE =================
+app = Flask(__name__)
+
+@app.route('/health')
+def health():
+    return "Bot is running", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
 # ================= HELPERS =================
 async def send_discord_message(message: str):
     if not DISCORD_WEBHOOK:
         print("[WARN] Discord webhook not configured")
         return
 
-    # chunking to avoid Discord 2000 char limit
     chunks = [message[i:i+1900] for i in range(0, len(message), 1900)]
     async with aiohttp.ClientSession() as session:
         for chunk in chunks:
@@ -45,7 +57,7 @@ async def fetch_ohlcv():
     ohlcv = EXCHANGE.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=LOOKBACK)
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata")  # IST conversion
+    df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata")
     return df
 
 # ================= INDICATOR LOGIC =================
@@ -55,7 +67,6 @@ def check_macd_signals(df: pd.DataFrame):
     macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
     df = pd.concat([df, macd], axis=1)
 
-    # Latest values
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -64,7 +75,6 @@ def check_macd_signals(df: pd.DataFrame):
 
     signals = []
 
-    # ---- Early Warning ----
     if macd_prev < 0 and macd_val >= 0:
         if last_macd_state["early"] != "bullish":
             signals.append("⚠️ Early Warning: MACD crossing ABOVE 0 (intracandle)")
@@ -74,8 +84,6 @@ def check_macd_signals(df: pd.DataFrame):
             signals.append("⚠️ Early Warning: MACD crossing BELOW 0 (intracandle)")
             last_macd_state["early"] = "bearish"
 
-    # ---- Confirmation (on candle close) ----
-    # Here, we confirm when the latest CLOSED candle is above/below 0
     if macd_val > 0:
         if last_macd_state["confirm"] != "bullish":
             signals.append("✅ Confirmation: MACD CLOSED above 0")
@@ -91,24 +99,25 @@ def check_macd_signals(df: pd.DataFrame):
 async def monitor():
     while True:
         try:
-            df = await asyncio.to_thread(fetch_ohlcv)
+            df = await fetch_ohlcv()
             signals = check_macd_signals(df)
 
             for signal in signals:
                 ts = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30)))
                 await send_discord_message(f"[{ts.strftime('%Y-%m-%d %H:%M:%S')}] {signal}")
 
-            # news alerts
             news_items = await fetch_news()
-            for n in news_items[:3]:  # limit to 3 latest
+            for n in news_items[:3]:
                 title = n.get("title", "")
                 url = n.get("url", "")
                 await send_discord_message(f"📰 News: {title}\n{url}")
 
         except Exception as e:
-            print(f"[ERROR] {e}")
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] {e}")
 
-        await asyncio.sleep(60)  # check every 1m
+        await asyncio.sleep(60)
 
+# ================= ENTRY POINT =================
 if __name__ == "__main__":
+    threading.Thread(target=run_flask).start()
     asyncio.run(monitor())
