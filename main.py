@@ -23,6 +23,10 @@ last_macd_state = {"early": None, "confirm": None}
 # ================= FLASK KEEP-ALIVE =================
 app = Flask(__name__)
 
+@app.route('/')
+def home():
+    return "✅ Bot is alive and monitoring MACD + news alerts!"
+
 @app.route('/health')
 def health():
     return "Bot is running", 200
@@ -121,3 +125,4 @@ async def monitor():
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
     asyncio.run(monitor())
+
