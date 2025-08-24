@@ -1,5 +1,4 @@
 requests
-numpy
 flask
 mplfinance
 matplotlib
@@ -7,6 +6,7 @@ python-binance
 ta
 pytz
 setuptools
+numpy<2.0
 pandas_ta==0.3.14b0
 
 
