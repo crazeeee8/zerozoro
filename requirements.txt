@@ -8,3 +8,5 @@ setuptools
 pandas
 ccxt
 aiohttp
+pandas-ta
+
