@@ -15,7 +15,7 @@ import random
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY")
 SYMBOL = "BTC/USDT"
-EXCHANGE = ccxt.binance()
+EXCHANGE = ccxt.binanceus()
 TIMEFRAME = "15m"
 LOOKBACK = 100
 
@@ -158,3 +158,4 @@ async def monitor():
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
     asyncio.run(monitor())
+
