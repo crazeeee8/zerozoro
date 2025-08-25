@@ -14,9 +14,10 @@ from aiohttp import ClientResponseError, ClientConnectorError, ClientPayloadErro
 from flask import Flask
 from config import CRYPTOPANIC_API_KEY, DISCORD_WEBHOOK, COINMARKETCAL_API_KEY
 
-CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", FILE_CRYPTOPANIC).strip()
-DISCORD_WEBHOOK     = os.getenv("DISCORD_WEBHOOK", FILE_WEBHOOK).strip()
-COINMARKETCAL_API_KEY = os.getenv("COINMARKETCAL_API_KEY", FILE_CMC).strip()
+CRYPTOPANIC_API_KEY = os.environ.get("CRYPTOPANIC_API_KEY")
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
+COINMARKETCAL_API_KEY = os.environ.get("COINMARKETCAL_API_KEY")
+
 
 # Comma-separated list of exchanges to try in order (auto-fallback if one fails/geoblocked)
 EXCHANGES_PREF = os.getenv(
@@ -429,5 +430,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
