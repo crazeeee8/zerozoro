@@ -1,16 +1,31 @@
-pytz
-setuptools
-numpy<2
-pandas
+# Core
+requests==2.32.5
+flask==3.1.2
+
+# Plotting (if you use it elsewhere)
+mplfinance==0.12.10b0
+matplotlib==3.10.5
+
+# Exchanges / data
+ccxt==4.5.1
+python-binance==1.0.29
+
+# TA library and deps — IMPORTANT pins
 pandas-ta==0.3.14b0
-matplotlib
-mplfinance
-ccxt
-aiohttp
-flask
-python-binance
-requests
-dateparser
-tzlocal
-cryptography
-pycryptodome
+numpy<2.0            # prevents pandas_ta importing NaN issue
+pandas==2.3.2
+
+# Async HTTP
+aiohttp==3.12.15
+aiodns==3.5.0
+pycares==4.10.0
+
+# Time utils
+dateparser==1.2.2
+pytz==2025.2
+tzlocal==5.3.1
+tzdata==2025.2
+regex==2025.7.34
+
+# Security / misc required by deps
+cryptography==45.0.6
