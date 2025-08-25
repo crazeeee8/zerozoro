@@ -271,19 +271,19 @@ def check_macd_signals(df: pd.DataFrame) -> List[str]:
     if "close" not in df or df["close"].isna().any():
         raise ValueError("DataFrame missing close or contains NaNs in close.")
 
-    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
+    macd = ta.macd(df["close"], fast=8, slow=15, signal=9)
     if macd is None or macd.empty:
         raise ValueError("MACD calculation failed or returned empty.")
 
-    df2 = pd.concat([df, macd], axis=1).dropna(subset=["MACD_12_26_9", "MACDs_12_26_9"])
+    df2 = pd.concat([df, macd], axis=1).dropna(subset=["MACD_8_15_9", "MACDs_8_15_9"])
     if len(df2) < 3:
         raise ValueError("Not enough MACD rows after dropna.")
 
     latest = df2.iloc[-1]
     prev = df2.iloc[-2]
 
-    macd_val = float(latest["MACD_12_26_9"])
-    macd_prev = float(prev["MACD_12_26_9"])
+    macd_val = float(latest["MACD_8_15_9"])
+    macd_prev = float(prev["MACD_8_15_9"])
 
     signals: List[str] = []
 
@@ -430,6 +430,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
