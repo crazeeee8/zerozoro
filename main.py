@@ -1,6 +1,6 @@
 import os
 import asyncio
-from binance
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
@@ -114,4 +114,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
