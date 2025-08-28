@@ -69,8 +69,8 @@ def detect_engulfing(df: pd.DataFrame) -> list:
         prev = df.iloc[i - 1]
         curr = df.iloc[i]
 
-        # FIX: Extract scalar values using .item() before performing comparisons.
-        # This resolves the "truth value of a Series is ambiguous" error.
+        # THOROUGH FIX: Extract all scalar values using .item() before any comparisons.
+        # This resolves the "truth value of a Series is ambiguous" error permanently.
         prev_open = prev["Open"].item()
         prev_close = prev["Close"].item()
         curr_open = curr["Open"].item()
