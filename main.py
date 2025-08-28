@@ -6,7 +6,7 @@ import requests
 
 # ================== CONFIG ==================
 # IMPORTANT: Replace with your actual Discord webhook URL
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/XXXXX/XXXXX"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1374711617127841922/U8kaZV_I_l1P6H6CFnBg6oWAFLnEUMLfiFpzq-DGM4GJrraRlYvHSHifboWqnYjkUYNR"
 TICKER = "BTC-USD"   # works with Yahoo Finance
 MACD_FAST = 12
 MACD_SLOW = 26
@@ -191,4 +191,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
+
 
