@@ -1,438 +1,321 @@
+# main.py
 import os
 import asyncio
+import json
+import math
+import time
 import random
 import threading
-from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set
 
+import aiohttp
 import pandas as pd
 import pandas_ta as ta
-import ccxt
-import aiohttp
-from aiohttp import ClientResponseError, ClientConnectorError, ClientPayloadError, ServerTimeoutError
+import websockets
 from flask import Flask
-from config import CRYPTOPANIC_API_KEY, DISCORD_WEBHOOK, COINMARKETCAL_API_KEY
 
-# Read directly from environment variables (no fallback file)
-CRYPTOPANIC_API_KEY = os.environ.get("CRYPTOPANIC_API_KEY", "").strip()
+# -----------------------
+# CONFIG / ENV
+# -----------------------
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
-COINMARKETCAL_API_KEY = os.environ.get("COINMARKETCAL_API_KEY", "").strip()
+PORT = int(os.environ.get("PORT", "10000"))
+SYMBOL = os.environ.get("SYMBOL", "BTCUSDT").strip().lower()  # Binance format
+USE_BIAS_FILTER = os.environ.get("USE_BIAS_FILTER", "true").lower() in ("1", "true", "yes")
+ENGULF_WATCH_PCT = float(os.environ.get("ENGULF_WATCH_PCT", "1.0"))  # 1.0 => 100% of prior body
+MACD_FAST = int(os.environ.get("MACD_FAST", "8"))
+MACD_SLOW = int(os.environ.get("MACD_SLOW", "15"))
+MACD_SIGNAL = int(os.environ.get("MACD_SIGNAL", "9"))
 
-# Comma-separated list of exchanges to try in order (auto-fallback if one fails/geoblocked)
-EXCHANGES_PREF = os.getenv(
-    "EXCHANGES",
-    "binance,binanceus,kucoin,kraken,bybit"
-).lower().replace(" ", "").split(",")
+# Binance combined websocket URL for 5m and 15m klines
+BINANCE_WS = f"wss://stream.binance.com:9443/stream?streams={SYMBOL}@kline_5m/{SYMBOL}@kline_15m"
 
-SYMBOL = os.getenv("SYMBOL", "BTC/USDT").strip()
-TIMEFRAME = os.getenv("TIMEFRAME", "15m").strip()
-LOOKBACK = int(os.getenv("LOOKBACK", "120"))
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
-
-# Timezone for display (IST)
+# timezone display (IST)
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Flask port for Render keep-alive
-PORT = int(os.getenv("PORT", "10000"))
+# -----------------------
+# STATE
+# -----------------------
+class State:
+    def __init__(self):
+        # store last closed candles
+        self.closes_15m: List[float] = []
+        self.timestamps_15m: List[int] = []
+        self.last_fast_direction: Optional[str] = None  # "bullish" or "bearish" based on last fast zero-cross
+        # 5m candles: previous closed and current open/live
+        self.prev_5m = None  # dict with o,h,l,c,t
+        self.curr_5m = None  # dict with o,h,l,c,t (latest update; closed when 'x' True)
+        # idempotency
+        self.sent_event_keys: Set[str] = set()
+        # aiohttp session
+        self.session: Optional[aiohttp.ClientSession] = None
 
-# =========================
-# ====== STATE ============
-# =========================
+STATE = State()
 
-@dataclass
-class BotState:
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    last_macd_state: Dict[str, Optional[str]] = field(default_factory=lambda: {"early": None, "confirm": None})
-    seen_news_ids: set = field(default_factory=set)
-    exchange_name: Optional[str] = None
-    exchange: Optional[ccxt.Exchange] = None
-    session: Optional[aiohttp.ClientSession] = None
-    posted_webhook_warning: bool = False
-
-STATE = BotState()
-
-# =========================
-# ====== UTILITIES ========
-# =========================
-
-def now_ist() -> datetime:
-    return datetime.now(timezone.utc).astimezone(IST)
-
-def jitter(base: float, frac: float = 0.3) -> float:
-    # Adds +/- 30% jitter by default
-    delta = base * frac
-    return base + random.uniform(-delta, delta)
+# -----------------------
+# UTIL
+# -----------------------
+def now_ist() -> str:
+    return datetime.now(timezone.utc).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
 
 async def ensure_session() -> aiohttp.ClientSession:
-    async with STATE.lock:
-        if STATE.session and not STATE.session.closed:
-            return STATE.session
-        # Reasonable default timeouts
-        timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
-        STATE.session = aiohttp.ClientSession(timeout=timeout)
+    if STATE.session and not STATE.session.closed:
         return STATE.session
-
-async def async_backoff(
-    fn,
-    *,
-    retries: int = 5,
-    base_delay: float = 1.5,
-    max_delay: float = 20.0,
-    exceptions: Tuple = (
-        ClientConnectorError,
-        ClientResponseError,
-        ClientPayloadError,
-        asyncio.TimeoutError,
-        ServerTimeoutError,
-    ),
-    retry_on_status: Tuple[int, ...] = (429, 500, 502, 503, 504),
-    label: str = "op"
-):
-    """
-    Generic async backoff wrapper for HTTP-like operations.
-    """
-    for attempt in range(1, retries + 1):
-        try:
-            return await fn()
-        except ClientResponseError as cre:
-            # Retry on transient HTTP
-            if cre.status in retry_on_status:
-                delay = min(max_delay, jitter(base_delay * (2 ** (attempt - 1))))
-                print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] {label} HTTP {cre.status}, retry {attempt}/{retries} in {delay:.1f}s")
-                await asyncio.sleep(delay)
-                continue
-            # Non-retryable HTTP
-            raise
-        except exceptions as e:
-            delay = min(max_delay, jitter(base_delay * (2 ** (attempt - 1))))
-            print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] {label} error {type(e).__name__}, retry {attempt}/{retries} in {delay:.1f}s: {e}")
-            await asyncio.sleep(delay)
-    # Final attempt (let exception bubble)
-    return await fn()
-
-async def to_thread_backoff(fn_sync, *, retries: int = 5, base_delay: float = 1.5, max_delay: float = 20.0, label: str = "ccxt"):
-    """
-    Backoff wrapper for sync functions (like ccxt) run in a thread.
-    """
-    for attempt in range(1, retries + 1):
-        try:
-            return await asyncio.to_thread(fn_sync)
-        except ccxt.BaseError as e:
-            # Retry for transient or rate-limit errors; geoblocks will be handled outside.
-            msg = str(e)
-            transient = any(k in msg.lower() for k in ["timeout", "temporarily unavailable", "rate limit", "request timeout", "service unavailable", "429", "5", "network"])
-            if transient and attempt < retries:
-                delay = min(max_delay, jitter(base_delay * (2 ** (attempt - 1))))
-                print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] {label} transient error, retry {attempt}/{retries} in {delay:.1f}s: {e}")
-                await asyncio.sleep(delay)
-                continue
-            raise
-
-# =========================
-# ====== EXCHANGES ========
-# =========================
-
-def instantiate_exchange(name: str) -> ccxt.Exchange:
-    # Map user string to ccxt constructor
-    name = name.lower()
-    if not hasattr(ccxt, name):
-        raise ValueError(f"Exchange '{name}' not found in ccxt")
-    ex_cls = getattr(ccxt, name)
-    ex = ex_cls({
-        "enableRateLimit": True,
-        "timeout": 15000,  # ms
-    })
-    return ex
-
-async def pick_working_exchange() -> Tuple[ccxt.Exchange, str]:
-    """
-    Try exchanges in EXCHANGES_PREF order; return first that loads markets successfully.
-    Detect geoblock (HTTP 451) and move on gracefully.
-    """
-    for name in EXCHANGES_PREF:
-        try:
-            ex = instantiate_exchange(name)
-            # load_markets is sync; run in thread + backoff
-            await to_thread_backoff(ex.load_markets, label=f"{name}.load_markets")
-            print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] Using exchange: {name}")
-            return ex, name
-        except ccxt.BaseError as e:
-            lower = str(e).lower()
-            if "451" in lower or "restricted location" in lower or "eligibility" in lower:
-                print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] {name} blocked in region (451). Trying next exchange...")
-                continue
-            print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] Failed to init {name}: {e}. Trying next...")
-        except Exception as e:
-            print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] Unexpected init error for {name}: {e}. Trying next...")
-    raise RuntimeError("No working exchange available from EXCHANGES list.")
-
-async def ensure_exchange():
-    async with STATE.lock:
-        if STATE.exchange is not None:
-            return STATE.exchange, STATE.exchange_name or "unknown"
-        ex, name = await pick_working_exchange()
-        STATE.exchange = ex
-        STATE.exchange_name = name
-        return ex, name
-
-# =========================
-# ====== HTTP CLIENTS =====
-# =========================
+    STATE.session = aiohttp.ClientSession()
+    return STATE.session
 
 async def send_discord_message(content: str):
     if not DISCORD_WEBHOOK:
-        if not STATE.posted_webhook_warning:
-            print("[WARN] Discord webhook not configured; set DISCORD_WEBHOOK to receive alerts.")
-            STATE.posted_webhook_warning = True
+        print(f"[{now_ist()}] [ALERT - NO WEBHOOK] {content}")
         return
-
     session = await ensure_session()
-
     async def _post():
         async with session.post(DISCORD_WEBHOOK, json={"content": content}) as resp:
             if resp.status not in (200, 204):
                 text = await resp.text()
-                raise ClientResponseError(resp.request_info, resp.history, status=resp.status, message=text)
+                raise RuntimeError(f"Discord returned {resp.status}: {text}")
+    # naive retry
+    for attempt in range(3):
+        try:
+            await _post()
+            return
+        except Exception as e:
+            print(f"[{now_ist()}] Discord send failed (attempt {attempt+1}): {e}")
+            await asyncio.sleep(0.8 * (2 ** attempt))
+    print(f"[{now_ist()}] Discord send ultimately failed: {content}")
 
-    try:
-        await async_backoff(_post, label="discord.post")
-    except Exception as e:
-        print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] Discord send failed: {type(e).__name__}: {e}")
+def event_key(kind: str, tf: str, bar_time: int, extra: Optional[str] = None) -> str:
+    if extra:
+        return f"{kind}|{tf}|{bar_time}|{extra}"
+    return f"{kind}|{tf}|{bar_time}"
 
-async def fetch_cryptopanic_news() -> List[Dict[str, Any]]:
-    if not CRYPTOPANIC_API_KEY:
-        return []
+def idempotent_send(kind: str, tf: str, bar_time: int, text: str, extra: Optional[str] = None):
+    key = event_key(kind, tf, bar_time, extra)
+    if key in STATE.sent_event_keys:
+        # already sent
+        return
+    STATE.sent_event_keys.add(key)
+    # fire and forget
+    asyncio.create_task(send_discord_message(f"[{now_ist()}] {text}"))
 
-    session = await ensure_session()
+# -----------------------
+# MACD 15m logic
+# -----------------------
+def compute_macd_from_closes(closes: List[float]) -> Optional[pd.DataFrame]:
+    # needs at least (max window * 3) but we will guard earlier
+    if len(closes) < max(MACD_SLOW, MACD_SIGNAL) + 3:
+        return None
+    s = pd.Series(closes)
+    macd = ta.macd(s, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
+    # macd columns: MACD_{fast}_{slow}_{signal}, MACDh, MACDs...
+    return macd
 
-    url = "https://cryptopanic.com/api/v1/posts/"
-    params = {"auth_token": CRYPTOPANIC_API_KEY, "currencies": "BTC", "public": "true"}
-
-    async def _get():
-        async with session.get(url, params=params) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                raise ClientResponseError(resp.request_info, resp.history, status=resp.status, message=text)
-            data = await resp.json()
-            results = data.get("results", [])
-            if not isinstance(results, list):
-                raise ValueError("Unexpected CryptoPanic response shape: 'results' not a list")
-            return results
-
-    try:
-        return await async_backoff(_get, label="cryptopanic.get")
-    except Exception as e:
-        print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] CryptoPanic failed: {type(e).__name__}: {e}")
-        return []
-
-# =========================
-# ====== MARKET DATA ======
-# =========================
-
-async def fetch_ohlcv() -> pd.DataFrame:
-    ex, ex_name = await ensure_exchange()
-
-    def _sync_fetch():
-        return ex.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=LOOKBACK)
-
-    try:
-        ohlcv = await to_thread_backoff(_sync_fetch, label=f"{ex_name}.fetch_ohlcv")
-    except ccxt.BaseError as e:
-        # If geoblock or exchange outage mid-run, rotate exchange next cycle
-        lower = str(e).lower()
-        if "451" in lower or "restricted location" in lower or "eligibility" in lower:
-            async with STATE.lock:
-                print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] {ex_name} became blocked; rotating exchange...")
-                STATE.exchange = None
-                STATE.exchange_name = None
-        raise
-
-    if not isinstance(ohlcv, list) or len(ohlcv) == 0:
-        raise ValueError("Empty OHLCV from exchange.")
-
-    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    # Basic validation
-    for col in ["timestamp", "open", "high", "low", "close", "volume"]:
-        if col not in df.columns:
-            raise ValueError(f"OHLCV missing column: {col}")
-
-    if len(df) < 35:
-        raise ValueError(f"Insufficient candles: {len(df)} (need >= 35)")
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(IST)
-    return df
-
-# =========================
-# ====== INDICATORS =======
-# =========================
-
-def check_macd_signals(df: pd.DataFrame) -> List[str]:
-    if "close" not in df or df["close"].isna().any():
-        raise ValueError("DataFrame missing close or contains NaNs in close.")
-
-    macd = ta.macd(df["close"], fast=8, slow=15, signal=9)
+def check_15m_macd_crosses():
+    # Called when a 15m bar closed and STATE.closes_15m updated
+    macd = compute_macd_from_closes(STATE.closes_15m)
     if macd is None or macd.empty:
-        raise ValueError("MACD calculation failed or returned empty.")
+        return
+    df = macd.dropna()
+    if len(df) < 2:
+        return
 
-    df2 = pd.concat([df, macd], axis=1).dropna(subset=["MACD_8_15_9", "MACDs_8_15_9"])
-    if len(df2) < 3:
-        raise ValueError("Not enough MACD rows after dropna.")
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    # column names come from pandas_ta, find the MACD line and signal names generically
+    macd_line_col = [c for c in macd.columns if c.startswith("MACD_") and "_" in c]
+    signal_col = [c for c in macd.columns if c.startswith("MACDs_")]
+    if not macd_line_col or not signal_col:
+        # fallback: names vary; try heuristics
+        macd_line_col = [c for c in macd.columns if "MACD" in c and "MACDs" not in c]
+        signal_col = [c for c in macd.columns if "MACDs" in c]
+    if not macd_line_col or not signal_col:
+        print(f"[{now_ist()}] Unable to identify MACD columns: {macd.columns}")
+        return
 
-    latest = df2.iloc[-1]
-    prev = df2.iloc[-2]
+    macd_line = float(latest[macd_line_col[0]])
+    macd_prev = float(prev[macd_line_col[0]])
+    signal_line = float(latest[signal_col[0]])
+    signal_prev = float(prev[signal_col[0]])
 
-    macd_val = float(latest["MACD_8_15_9"])
-    macd_prev = float(prev["MACD_8_15_9"])
+    # FAST (MACD line) zero-cross detection (crossing zero between prev and latest)
+    bar_time = STATE.timestamps_15m[-1] if STATE.timestamps_15m else int(time.time())
+    if macd_prev < 0 <= macd_line:
+        # crossed above
+        idempotent_send("FAST_CROSS", "15m", bar_time, f"MACD FAST crossed ABOVE 0 | BTC/USDT | 15m | macd={macd_line:.8f}")
+        STATE.last_fast_direction = "bullish"
+    elif macd_prev > 0 >= macd_line:
+        idempotent_send("FAST_CROSS", "15m", bar_time, f"MACD FAST crossed BELOW 0 | BTC/USDT | 15m | macd={macd_line:.8f}")
+        STATE.last_fast_direction = "bearish"
 
-    signals: List[str] = []
+    # SIGNAL (slow) zero-cross detection
+    if signal_prev < 0 <= signal_line:
+        idempotent_send("SIGNAL_CROSS", "15m", bar_time, f"MACD SIGNAL crossed ABOVE 0 | BTC/USDT | 15m | signal={signal_line:.8f}")
+    elif signal_prev > 0 >= signal_line:
+        idempotent_send("SIGNAL_CROSS", "15m", bar_time, f"MACD SIGNAL crossed BELOW 0 | BTC/USDT | 15m | signal={signal_line:.8f}")
 
-    # Early warning: zero-line crossing intra/at close detection
-    if macd_prev < 0 <= macd_val:
-        if STATE.last_macd_state.get("early") != "bullish":
-            signals.append("⚠️ Early Warning: MACD crossing ABOVE 0")
-            STATE.last_macd_state["early"] = "bullish"
-    elif macd_prev > 0 >= macd_val:
-        if STATE.last_macd_state.get("early") != "bearish":
-            signals.append("⚠️ Early Warning: MACD crossing BELOW 0")
-            STATE.last_macd_state["early"] = "bearish"
+# -----------------------
+# 5m engulfing logic
+# -----------------------
+def candle_body(o: float, c: float) -> float:
+    return abs(c - o)
 
-    # Confirmation: where it currently closes relative to zero
-    if macd_val > 0:
-        if STATE.last_macd_state.get("confirm") != "bullish":
-            signals.append("✅ Confirmation: MACD CLOSED above 0")
-            STATE.last_macd_state["confirm"] = "bullish"
-    elif macd_val < 0:
-        if STATE.last_macd_state.get("confirm") != "bearish":
-            signals.append("✅ Confirmation: MACD CLOSED below 0")
-            STATE.last_macd_state["confirm"] = "bearish"
+def is_textbook_engulf(prev_o, prev_c, o, c) -> Optional[str]:
+    # returns "bullish"/"bearish"/None per textbook strict rules
+    # bullish engulfing: open_n < close_{n-1} AND close_n > open_{n-1}
+    if o < prev_c and c > prev_o:
+        return "bullish"
+    # bearish engulfing: open_n > close_{n-1} AND close_n < open_{n-1}
+    if o > prev_c and c < prev_o:
+        return "bearish"
+    return None
 
-    return signals
-
-# =========================
-# ====== NEWS HANDLING ====
-# =========================
-
-def pick_new_news(news: List[Dict[str, Any]]) -> List[Tuple[str, str, str]]:
+def check_engulfing_watch_and_confirm(prev_candle: Dict, curr_candle: Dict, closed: bool):
     """
-    Returns list of (id, title, url) that haven't been seen yet.
+    prev_candle and curr_candle format: { 'o': float, 'h': float, 'l': float, 'c': float, 't': int }
+    'closed' indicates whether curr_candle is a closed bar (True) or intrabar update (False)
     """
-    fresh: List[Tuple[str, str, str]] = []
-    for n in news:
-        nid = str(n.get("id", ""))
-        title = n.get("title", "")
-        url = n.get("url", "")
-        if not nid or not title or not url:
-            continue
-        if nid in STATE.seen_news_ids:
-            continue
-        STATE.seen_news_ids.add(nid)
-        fresh.append((nid, title, url))
-    return fresh
+    if not prev_candle or not curr_candle:
+        return
 
-# =========================
-# ====== FLASK KEEPALIVE ==
-# =========================
+    prev_o, prev_c = float(prev_candle["o"]), float(prev_candle["c"])
+    o, c = float(curr_candle["o"]), float(curr_candle["c"])
+    bar_time = curr_candle["t"]
 
+    prev_body = candle_body(prev_o, prev_c)
+    curr_body = candle_body(o, c)
+
+    # intrabar watch: does current *live* body already engulf previous body by >= ENGULF_WATCH_PCT?
+    # define engulf as curr_body >= ENGULF_WATCH_PCT * prev_body AND
+    # the current midpoints indicate directional overlap with prior body.
+    if prev_body > 0 and curr_body >= ENGULF_WATCH_PCT * prev_body and not closed:
+        # determine direction by comparing midpoint movement (simpler heuristic)
+        if (c > o) and (o <= prev_c):
+            direction = "bullish"
+        elif (c < o) and (o >= prev_c):
+            direction = "bearish"
+        else:
+            direction = None
+        if direction:
+            # bias filter when enabled
+            if USE_BIAS_FILTER and STATE.last_fast_direction and STATE.last_fast_direction != direction:
+                return
+            idempotent_send("ENGULF_WATCH", "5m", bar_time, f"ENGULFING_WATCH ({direction}) forming (intrabar) | BTC/USDT | 5m | curr_body={curr_body:.8f} prev_body={prev_body:.8f}")
+
+    # on close, check textbook engulf
+    if closed:
+        direction = is_textbook_engulf(prev_o, prev_c, o, c)
+        if direction:
+            if USE_BIAS_FILTER and STATE.last_fast_direction and STATE.last_fast_direction != direction:
+                return
+            # send confirmed engulfing alert
+            idempotent_send("ENGULF_CONFIRMED", "5m", bar_time, f"ENGULFING_CONFIRMED ({direction}) | BTC/USDT | 5m | open={o:.2f} close={c:.2f} prev_open={prev_o:.2f} prev_close={prev_c:.2f}")
+
+# -----------------------
+# WebSocket handling
+# -----------------------
+async def handle_combined_binance():
+    backoff = 1.0
+    while True:
+        try:
+            async with websockets.connect(BINANCE_WS, ping_interval=20, ping_timeout=10) as ws:
+                print(f"[{now_ist()}] Connected to Binance WS")
+                backoff = 1.0
+                async for msg in ws:
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        continue
+                    # Combined stream format: {"stream":"btcusdt@kline_5m","data":{...}}
+                    stream = data.get("stream") or ""
+                    payload = data.get("data") or data
+                    # kline payload lives in payload['k']
+                    k = payload.get("k") or {}
+                    if not k:
+                        continue
+                    is_closed = bool(k.get("x", False))
+                    tf = "5m" if "kline_5m" in stream else "15m" if "kline_15m" in stream else None
+                    if tf == "15m":
+                        # closed bars only for MACD calculations
+                        if is_closed:
+                            # k has t (start time), o,h,l,c,v
+                            o = float(k["o"]); c = float(k["c"])
+                            ts = int(k["t"])  # ms
+                            # append close
+                            STATE.closes_15m.append(c)
+                            STATE.timestamps_15m.append(ts)
+                            # keep lookback reasonable (300)
+                            if len(STATE.closes_15m) > 500:
+                                STATE.closes_15m = STATE.closes_15m[-500:]
+                                STATE.timestamps_15m = STATE.timestamps_15m[-500:]
+                            # compute macd crosses
+                            try:
+                                check_15m_macd_crosses()
+                            except Exception as e:
+                                print(f"[{now_ist()}] Error in MACD check: {e}")
+                    elif tf == "5m":
+                        # build prev/current candlesticks and feed to engulfing logic
+                        o = float(k["o"]); c = float(k["c"]); h = float(k["h"]); l = float(k["l"]); ts = int(k["t"])
+                        # if bar closed, move curr -> prev, set curr to closed bar
+                        if is_closed:
+                            # previous closed becomes prev
+                            prev = STATE.curr_5m if STATE.curr_5m else STATE.prev_5m
+                            closed_candle = {"o": o, "h": h, "l": l, "c": c, "t": ts}
+                            # feed confirm: prev (previous closed) vs closed_candle
+                            if prev:
+                                try:
+                                    check_engulfing_watch_and_confirm(prev, closed_candle, closed=True)
+                                except Exception as e:
+                                    print(f"[{now_ist()}] Error in engulf confirm: {e}")
+                            # shift prev and curr
+                            STATE.prev_5m = closed_candle
+                            STATE.curr_5m = None
+                        else:
+                            # intrabar update: k contains current live open and current close
+                            live_candle = {"o": o, "h": h, "l": l, "c": c, "t": ts}
+                            # compare with previous closed (STATE.prev_5m)
+                            try:
+                                check_engulfing_watch_and_confirm(STATE.prev_5m, live_candle, closed=False)
+                            except Exception as e:
+                                print(f"[{now_ist()}] Error in engulf watch: {e}")
+                            STATE.curr_5m = live_candle
+                    # else: ignore
+        except Exception as e:
+            print(f"[{now_ist()}] Binance WS error: {type(e).__name__}: {e}. Reconnecting in {backoff:.1f}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.8 + random.random() * 0.5, 60.0)
+
+# -----------------------
+# STARTUP / FLASK
+# -----------------------
 app = Flask(__name__)
 
 @app.get("/")
 def home():
-    ex = STATE.exchange_name or "uninitialized"
-    return f"✅ Bot alive. Exchange={ex} | Symbol={SYMBOL} | TF={TIMEFRAME} | Lookback={LOOKBACK}", 200
+    bias = STATE.last_fast_direction or "none"
+    return f"✅ Bot alive. Symbol={SYMBOL} | Bias={bias} | USE_BIAS_FILTER={USE_BIAS_FILTER}", 200
 
 @app.get("/health")
 def health():
     return "ok", 200
 
 def run_flask():
-    # Production note: this is only a keep-alive server, dev WSGI is fine here.
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
-# =========================
-# ====== MAIN LOOP ========
-# =========================
-
-async def startup_test():
-    # Test message so you don't wait for the first event
-    ex, ex_name = await ensure_exchange()
-    await send_discord_message(f"🤖 Bot started on `{ex_name}` | {SYMBOL} {TIMEFRAME} | {now_ist().strftime('%Y-%m-%d %H:%M:%S')}")
-    # Try market + MACD quickly
-    try:
-        df = await fetch_ohlcv()
-        sigs = check_macd_signals(df)
-        if sigs:
-            for s in sigs:
-                await send_discord_message(f"🧪 Startup check: {s}")
-        else:
-            await send_discord_message("🧪 Startup check: no new MACD signals right now.")
-    except Exception as e:
-        await send_discord_message(f"🧪 Startup market check failed: {type(e).__name__}: {e}")
-
-    # Try news quickly
-    try:
-        news = await fetch_cryptopanic_news()
-        fresh = pick_new_news(news)[:3]
-        if fresh:
-            for _, title, url in fresh:
-                await send_discord_message(f"🧪 Startup news: {title}\n{url}")
-        else:
-            await send_discord_message("🧪 Startup news: none returned (or API key missing).")
-    except Exception as e:
-        await send_discord_message(f"🧪 Startup news check failed: {type(e).__name__}: {e}")
-
-async def monitor():
-    await startup_test()
-
-    while True:
-        try:
-            # Market
-            df = await fetch_ohlcv()
-            signals = check_macd_signals(df)
-            for signal in signals:
-                ts = now_ist().strftime('%Y-%m-%d %H:%M:%S')
-                await send_discord_message(f"[{ts}] {signal}")
-
-            # News
-            news_items = await fetch_cryptopanic_news()
-            for _, title, url in pick_new_news(news_items)[:3]:
-                await send_discord_message(f"📰 News: {title}\n{url}")
-
-        except ccxt.BaseError as e:
-            # If exchange error occurs, try rotating next loop
-            msg = str(e).lower()
-            if "451" in msg or "restricted location" in msg or "eligibility" in msg:
-                async with STATE.lock:
-                    print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] Exchange geoblocked; resetting exchange.")
-                    STATE.exchange = None
-                    STATE.exchange_name = None
-            else:
-                print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] CCXT error: {e}")
-        except Exception as e:
-            print(f"[{now_ist().strftime('%Y-%m-%d %H:%M:%S')}] Unexpected error: {type(e).__name__}: {e}")
-
-        await asyncio.sleep(POLL_SECONDS)
+async def startup_probe():
+    # small startup message
+    idempotent_send("SYSTEM", "startup", int(time.time()*1000), f"Bot starting on Binance WS | SYMBOL={SYMBOL} | ENGULF_WATCH_PCT={ENGULF_WATCH_PCT} | USE_BIAS_FILTER={USE_BIAS_FILTER}")
 
 async def main_async():
-    # Pre-create client session
+    # create session
     await ensure_session()
-    # Ensure exchange selected
-    await ensure_exchange()
-    # Run monitor
-    await monitor()
+    await startup_probe()
+    # run websocket handler
+    await handle_combined_binance()
 
 def main():
-    # Start keep-alive server
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
-    # Run async bot
     asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
