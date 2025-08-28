@@ -19,7 +19,7 @@ import pandas as pd
 import yfinance as yf
 
 # ============ CONFIG (override via environment variables in Render) ============
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1374711617127841922/U8kaZV_I_l1P6H6CFnBg6oWAFLnEUMLfiFpzq-DGM4GJrraRlYvHSHifboWqnYjkUYNR")
 TICKER = os.environ.get("TICKER", "BTC-USD")
 MACD_FAST = int(os.environ.get("MACD_FAST", 8))
 MACD_SLOW = int(os.environ.get("MACD_SLOW", 15))
@@ -286,3 +286,4 @@ if __name__ == "__main__":
         print("[Fatal] unhandled:", e)
         traceback.print_exc()
         raise
+
