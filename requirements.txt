@@ -9,7 +9,9 @@ matplotlib==3.10.5
 
 # Exchanges / data
 ccxt==4.5.1
-python-binance==1.0.29
+yfinance
+aiohttp
+
 
 # TA library and deps — IMPORTANT pins
 pandas-ta==0.3.14b0
@@ -30,4 +32,5 @@ regex==2025.7.34
 
 # Security / misc required by deps
 cryptography==45.0.6
+
 
