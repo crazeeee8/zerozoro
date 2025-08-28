@@ -1,6 +1,7 @@
 # Core
 requests==2.32.5
 flask==3.1.2
+python-binance
 
 # Plotting (if you use it elsewhere)
 mplfinance==0.12.10b0
@@ -29,3 +30,4 @@ regex==2025.7.34
 
 # Security / misc required by deps
 cryptography==45.0.6
+
