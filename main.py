@@ -5,10 +5,10 @@ import yfinance as yf
 import requests
 
 # ================== CONFIG ==================
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/XXXXX/XXXXX"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1374711617127841922/U8kaZV_I_l1P6H6CFnBg6oWAFLnEUMLfiFpzq-DGM4GJrraRlYvHSHifboWqnYjkUYNR"
 TICKER = "BTC-USD"   # works with Yahoo Finance
-MACD_FAST = 12
-MACD_SLOW = 26
+MACD_FAST = 8
+MACD_SLOW = 15
 MACD_SIGNAL = 9
 ENGULFING_FILTER = True  # only in direction of 15m MACD cross
 # ============================================
@@ -135,3 +135,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
