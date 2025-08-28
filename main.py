@@ -69,15 +69,22 @@ def detect_engulfing(df: pd.DataFrame) -> list:
         prev = df.iloc[i - 1]
         curr = df.iloc[i]
 
-        prev_body = prev["Close"] - prev["Open"]
-        curr_body = curr["Close"] - curr["Open"]
+        # FIX: Extract scalar values using .item() before performing comparisons.
+        # This resolves the "truth value of a Series is ambiguous" error.
+        prev_open = prev["Open"].item()
+        prev_close = prev["Close"].item()
+        curr_open = curr["Open"].item()
+        curr_close = curr["Close"].item()
+
+        prev_body = prev_close - prev_open
+        curr_body = curr_close - curr_open
 
         # Bullish engulfing: Previous candle is red, current is green and bigger
-        if prev_body < 0 and curr_body > 0 and curr["Close"] > prev["Open"] and curr["Open"] < prev["Close"]:
+        if prev_body < 0 and curr_body > 0 and curr_close > prev_open and curr_open < prev_close:
             engulfings.append((curr.name, "bullish"))
 
         # Bearish engulfing: Previous candle is green, current is red and bigger
-        elif prev_body > 0 and curr_body < 0 and curr["Close"] < prev["Open"] and curr["Open"] > prev["Close"]:
+        elif prev_body > 0 and curr_body < 0 and curr_close < prev_open and curr_open > prev_close:
             engulfings.append((curr.name, "bearish"))
 
     return engulfings
@@ -191,6 +198,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
-
-
-
