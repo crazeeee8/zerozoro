@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binance-based trading alert bot (zero pandas/numpy/aiohttp).
+CoinGecko-based trading alert bot (zero pandas/numpy/aiohttp).
 Features:
 - 15m MACD zero-line + signal-line cross alerts (updates bias)
 - 5m Engulfing detection (filtered by 15m bias if enabled)
@@ -28,15 +28,13 @@ DISCORD_WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
     "https://discord.com/api/webhooks/1374711617127841922/U8kaZV_I_l1P6H6CFnBg6oWAFLnEUMLfiFpzq-DGM4GJrraRlYvHSHifboWqnYjkUYNR"
 )
-# Accept "BTC-USD" or "BTCUSDT" etc.
-TICKER = os.environ.get("TICKER", "BTC-USD").upper()
-SYMBOL_OVERRIDE = os.environ.get("SYMBOL", "")  # optional direct Binance symbol
+# Accept "BTC-USD" or CoinGecko IDs like "bitcoin"
+TICKER = os.environ.get("TICKER", "bitcoin").lower()
 MACD_FAST = int(os.environ.get("MACD_FAST", 8))
 MACD_SLOW = int(os.environ.get("MACD_SLOW", 15))
 MACD_SIGNAL = int(os.environ.get("MACD_SIGNAL", 9))
 ENGULFING_FILTER = os.environ.get("ENGULFING_FILTER", "True").lower() in ("1", "true", "yes")
 FETCH_INTERVAL = int(os.environ.get("FETCH_INTERVAL", 60))  # seconds between checks
-BINANCE_BASE_URL = os.environ.get("BINANCE_BASE_URL", "https://api.binance.com")
 PORT = int(os.environ.get("PORT", "8000"))
 # ----------------------------------------
 
@@ -61,16 +59,6 @@ def fmt_ts(dt: datetime.datetime) -> str:
     return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def ticker_to_binance_symbol(ticker: str) -> str:
-    t = ticker.upper().replace("/", "").replace("-", "")
-    if t.endswith("USD"):
-        return t[:-3] + "USDT"
-    return t
-
-
-BINANCE_SYMBOL = SYMBOL_OVERRIDE.upper() if SYMBOL_OVERRIDE else ticker_to_binance_symbol(TICKER)
-
-
 # ---------------- Discord helper ----------------
 def send_discord_alert(message: str) -> None:
     if not DISCORD_WEBHOOK_URL:
@@ -85,52 +73,58 @@ def send_discord_alert(message: str) -> None:
         print("[Discord] error sending message:", e)
 
 
-# ---------------- Binance REST fetch (no libraries) ----------------
-def binance_klines(symbol: str, interval: str, limit: int = 500, max_retries: int = 3) -> List[Dict]:
+# ---------------- CoinGecko REST fetch ----------------
+def coingecko_ohlc(symbol: str, interval: str, max_retries: int = 3) -> List[Dict]:
     """
     Returns a list of dicts:
-      {open_time, close_time (datetime UTC), open, high, low, close, volume}
-    Only returns closed candles (filters out current open candle).
+      {open_time, close_time (datetime UTC), open, high, low, close, volume=0}
+    Only closed candles.
     """
-    url = f"{BINANCE_BASE_URL}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}
+    if interval == "5m":
+        days = 1  # last 24h
+    elif interval == "15m":
+        days = 7  # last 7d
+    else:
+        raise ValueError(f"Unsupported interval: {interval}")
+
+    url = f"https://api.coingecko.com/api/v3/coins/{symbol.lower()}/ohlc"
+    params = {"vs_currency": "usd", "days": days}
+
     sess = requests.Session()
     now_ms = int(time.time() * 1000)
+
     for attempt in range(1, max_retries + 1):
         try:
             resp = sess.get(url, params=params, timeout=10)
-            if resp.status_code in (418, 429):
-                wait = int(resp.headers.get("Retry-After", "3"))
-                print(f"[Binance] rate-limited ({resp.status_code}), sleeping {wait}s")
-                time.sleep(wait)
-                continue
             if resp.status_code != 200:
-                print(f"[Binance] HTTP {resp.status_code}: {resp.text}")
+                print(f"[CoinGecko] HTTP {resp.status_code}: {resp.text}")
                 time.sleep(1 + attempt)
                 continue
             raw = resp.json()
             if not isinstance(raw, list) or len(raw) == 0:
-                print("[Binance] empty response; retrying")
+                print("[CoinGecko] empty response; retrying")
                 time.sleep(1 + attempt)
                 continue
             out = []
             for row in raw:
-                open_time_ms = int(row[0])
-                close_time_ms = int(row[6])
-                # only closed candles
-                if close_time_ms > now_ms - 1000:
+                ts_ms = int(row[0])
+                if ts_ms > now_ms - 1000:
                     continue
+                close_time = datetime.datetime.utcfromtimestamp(ts_ms / 1000.0).replace(tzinfo=datetime.timezone.utc)
                 out.append({
-                    "open_time": datetime.datetime.utcfromtimestamp(open_time_ms / 1000.0).replace(tzinfo=datetime.timezone.utc),
-                    "close_time": datetime.datetime.utcfromtimestamp(close_time_ms / 1000.0).replace(tzinfo=datetime.timezone.utc),
-                    "open": float(row[1]), "high": float(row[2]), "low": float(row[3]),
-                    "close": float(row[4]), "volume": float(row[5])
+                    "open_time": close_time,
+                    "close_time": close_time,
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": 0.0,
                 })
             if out:
                 return out
             time.sleep(1 + attempt)
         except Exception as e:
-            print(f"[Binance] exception attempt {attempt}: {e}")
+            print(f"[CoinGecko] exception attempt {attempt}: {e}")
             time.sleep(1 + attempt)
     return []
 
@@ -157,12 +151,9 @@ def compute_macd(closes: List[float]) -> Dict[str, List[float]]:
     macd = []
     for f, s in zip(ema_fast, ema_slow):
         macd.append((f - s) if (not math.isnan(f) and not math.isnan(s)) else math.nan)
-    # for signal EMA, treat nan as 0 initial to get reasonable smoothing
     macd_for_signal = [0.0 if math.isnan(x) else x for x in macd]
     signal = ema_list(macd_for_signal, MACD_SIGNAL)
-    hist = []
-    for m, s in zip(macd, signal):
-        hist.append((m - s) if (not math.isnan(m) and not math.isnan(s)) else math.nan)
+    hist = [(m - s) if (not math.isnan(m) and not math.isnan(s)) else math.nan for m, s in zip(macd, signal)]
     return {"macd": macd, "signal": signal, "hist": hist}
 
 
@@ -211,7 +202,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(f"OK - {BINANCE_SYMBOL} - uptime {uptime}s\n".encode())
+            self.wfile.write(f"OK - {TICKER.upper()} - uptime {uptime}s\n".encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -238,10 +229,9 @@ start_health_server_now()
 
 # ---------------- Observers ----------------
 async def macd_observer():
-    session = requests.Session()
     while not STOP_EVENT.is_set():
         try:
-            candles = binance_klines(BINANCE_SYMBOL, "15m", limit=500)
+            candles = coingecko_ohlc(TICKER, "15m")
             if len(candles) < max(MACD_SLOW + 2, 10):
                 await asyncio.sleep(10)
                 continue
@@ -277,10 +267,9 @@ async def macd_observer():
 
 
 async def engulfing_observer():
-    session = requests.Session()
     while not STOP_EVENT.is_set():
         try:
-            candles = binance_klines(BINANCE_SYMBOL, "5m", limit=500)
+            candles = coingecko_ohlc(TICKER, "5m")
             if len(candles) < 2:
                 await asyncio.sleep(10)
                 continue
@@ -322,8 +311,8 @@ signal.signal(signal.SIGTERM, _signal_handler)
 
 # ---------------- main ----------------
 async def main():
-    print(f"[Init] Monitoring {BINANCE_SYMBOL} | ENGULFING_FILTER={ENGULFING_FILTER} | FETCH_INTERVAL={FETCH_INTERVAL}s")
-    send_discord_alert(f"✅ Bot started for {BINANCE_SYMBOL} (from {TICKER}).")
+    print(f"[Init] Monitoring {TICKER.upper()} | ENGULFING_FILTER={ENGULFING_FILTER} | FETCH_INTERVAL={FETCH_INTERVAL}s")
+    send_discord_alert(f"✅ Bot started for {TICKER.upper()}.")
     tasks = [asyncio.create_task(macd_observer()), asyncio.create_task(engulfing_observer())]
     try:
         while not STOP_EVENT.is_set():
