@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-main.py - Trading alert observers using Binance for OHLC data.
-Features:
-- 15m MACD observer (zero-line + MACD-signal crosses)
-- 5m Engulfing observer (filtered by 15m MACD bias if enabled)
-- Discord alerts via webhook
-- Tiny HTTP health server (binds to $PORT for Render web services)
-- Graceful shutdown on SIGINT/SIGTERM
+main.py — Binance-based trading alerts (zero pandas/yfinance dependencies)
+- 15m MACD (signal crossover + zero-line cross) with bias tracking
+- 5m Engulfing pattern (optional filter by last 15m MACD bias)
+- Discord webhook notifications
+- Health HTTP server bound immediately so Render sees an open port
+- Robust Binance REST fetch with retries and closed-candle filtering
 """
 
 import os
@@ -18,332 +17,339 @@ import signal
 import traceback
 import asyncio
 import datetime
+import json
+import math
+from typing import List, Dict, Optional, Tuple
 import requests
-import pandas as pd
-import numpy as np
-from binance import AsyncClient
 
-# ============ CONFIG (env overrides) ============
+# ================== CONFIG (override via Render env) ==================
 DISCORD_WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
     "https://discord.com/api/webhooks/1374711617127841922/U8kaZV_I_l1P6H6CFnBg6oWAFLnEUMLfiFpzq-DGM4GJrraRlYvHSHifboWqnYjkUYNR"
 )
-TICKER = os.environ.get("TICKER", "BTC-USD")  # keeps compatibility; mapped to Binance symbol
+# Accept either SYMBOL or TICKER; TICKER like "BTC-USD" is auto-mapped to "BTCUSDT"
+TICKER = os.environ.get("TICKER", "BTC-USD").upper()
+SYMBOL = (os.environ.get("SYMBOL") or "").upper()  # optional explicit Binance symbol
 MACD_FAST = int(os.environ.get("MACD_FAST", 8))
 MACD_SLOW = int(os.environ.get("MACD_SLOW", 15))
 MACD_SIGNAL = int(os.environ.get("MACD_SIGNAL", 9))
 ENGULFING_FILTER = os.environ.get("ENGULFING_FILTER", "True").lower() in ("1", "true", "yes")
-# observer sleep settings
-MACD_OBSERVER_SLEEP = int(os.environ.get("MACD_OBSERVER_SLEEP", 60))  # seconds (main loop delay)
-ENGULFING_OBSERVER_SLEEP = int(os.environ.get("ENGULFING_OBSERVER_SLEEP", 60))
-# ==================================================================
+FETCH_INTERVAL = int(os.environ.get("FETCH_INTERVAL", 60))  # seconds between checks
+BINANCE_BASE_URL = os.environ.get("BINANCE_BASE_URL", "https://api.binance.com")  # switch to https://api.binance.us if needed
 
-# Shared state and runtime globals
-shared_state = {"last_15m_macd_bias": None}
-STOP_EVENT = threading.Event()
+# Health server
+PORT = int(os.environ.get("PORT", "8000"))
+# =====================================================================
+
+# ---------- shared state / globals ----------
 START_TIME = time.time()
+STOP_EVENT = threading.Event()
 HEALTH_SERVER = None
-BINANCE_CLIENT = None  # AsyncClient instance (created lazily)
 
+# For deduping alerts across loops
+last_alerted = {
+    "15m_fast_cross": None,      # "bullish" | "bearish"
+    "15m_signal_cross": None,    # "bullish" | "bearish"
+    "5m_engulfing_time": None,   # datetime of last engulfing candle alerted
+}
+shared_state = {
+    "last_15m_macd_bias": None   # "bullish" | "bearish"
+}
 
-# ---------------- Discord ----------------
-def send_discord_alert(message: str):
-    """Send a message to Discord webhook (non-blocking-ish, with timeout)."""
+# ---------- helpers ----------
+def now_utc() -> datetime.datetime:
+    return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+
+def fmt_ts(dt: datetime.datetime) -> str:
+    try:
+        return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(dt)
+
+def ticker_to_binance_symbol(ticker: str) -> str:
+    """
+    Convert a Yahoo-style ticker like 'BTC-USD' to Binance symbol 'BTCUSDT'.
+    If ticker already looks like a Binance symbol (e.g., BTCUSDT), return as-is.
+    """
+    t = ticker.upper().replace("-", "")
+    if t.endswith("USD"):
+        # Binance uses USDT for most USD-quoted pairs
+        return t[:-3] + "USDT"
+    return t
+
+BINANCE_SYMBOL = SYMBOL or ticker_to_binance_symbol(TICKER)
+
+# Map Binance interval string to seconds
+INTERVAL_TO_SECONDS = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800, "12h": 43200,
+    "1d": 86400, "3d": 259200, "1w": 604800, "1M": 2592000,
+}
+
+# ---------- Discord ----------
+def send_discord_alert(message: str) -> None:
     if not DISCORD_WEBHOOK_URL:
-        print("[Discord] webhook not configured - message:", message)
+        print("[Discord] webhook not configured; message:", message)
         return
     try:
-        payload = {"content": f"[{datetime.datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"}
-        # small timeout to avoid blocking the app indefinitely
+        payload = {"content": f"[{now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC] {message}"}
         resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=8)
         if resp.status_code >= 400:
-            print(f"[Discord] HTTP {resp.status_code}: {resp.text}")
+            print(f"[Discord] HTTP {resp.status_code} - {resp.text}")
     except Exception as e:
         print("[Discord error]", e)
 
+# ---------- Binance fetch ----------
+def binance_klines(
+    symbol: str,
+    interval: str,
+    limit: int = 200,
+    session: Optional[requests.Session] = None,
+    timeout: int = 10,
+    max_retries: int = 3
+) -> List[Dict]:
+    """
+    Fetch klines from Binance public REST with retries & basic rate-limit handling.
+    Returns list of dicts with open_time, close_time (datetime), open, high, low, close, volume (floats).
+    Only **closed** candles are returned (filters out the current building candle).
+    """
+    url = f"{BINANCE_BASE_URL}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}
+    sess = session or requests.Session()
 
-# ---------------- Health HTTP server (so Render detects $PORT) ----------------
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = sess.get(url, params=params, timeout=timeout)
+            # Handle rate limiting
+            if r.status_code == 429 or r.status_code == 418:
+                wait_s = int(r.headers.get("Retry-After", "3"))
+                print(f"[Binance] rate limited ({r.status_code}), sleeping {wait_s}s...")
+                time.sleep(wait_s)
+                continue
+            if r.status_code != 200:
+                print(f"[Binance] HTTP {r.status_code}: {r.text}")
+                time.sleep(1 + attempt)  # small backoff
+                continue
+
+            raw = r.json()
+            if not isinstance(raw, list):
+                print(f"[Binance] unexpected JSON: {raw}")
+                time.sleep(1 + attempt)
+                continue
+
+            out = []
+            now_ms = int(time.time() * 1000)
+            for row in raw:
+                # row format per Binance docs
+                # [ openTime, open, high, low, close, volume, closeTime, quote, trades, takerBuyBase, takerBuyQuote, ignore ]
+                open_time_ms = int(row[0])
+                close_time_ms = int(row[6])
+                # Keep only closed candles (close_time <= "now" - small guard)
+                if close_time_ms > now_ms - 1000:
+                    continue
+
+                o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4]); v = float(row[5])
+                out.append({
+                    "open_time": datetime.datetime.utcfromtimestamp(open_time_ms / 1000.0).replace(tzinfo=datetime.timezone.utc),
+                    "close_time": datetime.datetime.utcfromtimestamp(close_time_ms / 1000.0).replace(tzinfo=datetime.timezone.utc),
+                    "open": o, "high": h, "low": l, "close": c, "volume": v
+                })
+
+            if out:
+                return out
+
+            # If we got here, either empty or all were unclosed
+            print("[Binance] no closed candles returned; retrying...")
+            time.sleep(1 + attempt)
+        except Exception as e:
+            print(f"[Binance] error attempt {attempt}: {e}")
+            time.sleep(1 + attempt)
+
+    return []
+
+# ---------- Indicators (pure Python) ----------
+def ema_series(values: List[float], span: int) -> List[float]:
+    """Exponential moving average (same alpha as pandas: alpha = 2/(span+1))."""
+    if span <= 0 or not values:
+        return [math.nan] * len(values)
+    alpha = 2.0 / (span + 1.0)
+    out = []
+    ema_val = None
+    for v in values:
+        if ema_val is None:
+            ema_val = v
+        else:
+            ema_val = alpha * v + (1 - alpha) * ema_val
+        out.append(ema_val)
+    return out
+
+def compute_macd(closes: List[float]) -> Dict[str, List[float]]:
+    ema_fast = ema_series(closes, MACD_FAST)
+    ema_slow = ema_series(closes, MACD_SLOW)
+    macd = [(f - s) if (not math.isnan(f) and not math.isnan(s)) else math.nan for f, s in zip(ema_fast, ema_slow)]
+    signal = ema_series([x if not math.isnan(x) else 0.0 for x in macd], MACD_SIGNAL)
+    hist = [(m - s) if (not math.isnan(m) and not math.isnan(s)) else math.nan for m, s in zip(macd, signal)]
+    return {"ema_fast": ema_fast, "ema_slow": ema_slow, "macd": macd, "signal": signal, "hist": hist}
+
+def detect_zero_cross(series: List[float]) -> Optional[str]:
+    """Return 'bullish' if cross from <=0 to >0, 'bearish' if >=0 to <0, else None."""
+    if len(series) < 2:
+        return None
+    prev, curr = series[-2], series[-1]
+    if prev <= 0 < curr:
+        return "bullish"
+    if prev >= 0 > curr:
+        return "bearish"
+    return None
+
+def detect_signal_cross(macd: List[float], signal: List[float]) -> Optional[str]:
+    """Return 'bullish' when MACD crosses above Signal, 'bearish' when below, else None."""
+    if len(macd) < 2 or len(signal) < 2:
+        return None
+    if macd[-2] <= signal[-2] and macd[-1] > signal[-1]:
+        return "bullish"
+    if macd[-2] >= signal[-2] and macd[-1] < signal[-1]:
+        return "bearish"
+    return None
+
+def detect_engulfing(candles: List[Dict]) -> Optional[Tuple[datetime.datetime, str]]:
+    """
+    Detect last bullish/bearish engulfing on the series and return (time, 'bullish'|'bearish'), else None.
+    Uses standard body-engulf rules on consecutive closed candles.
+    """
+    if len(candles) < 2:
+        return None
+    prev = candles[-2]
+    curr = candles[-1]
+    # Bullish engulfing: prev red, curr green, and current body engulfs previous body
+    prev_body = prev["close"] - prev["open"]
+    curr_body = curr["close"] - curr["open"]
+
+    # bullish
+    if prev_body < 0 and curr_body > 0 and curr["close"] >= prev["open"] and curr["open"] <= prev["close"]:
+        return (curr["close_time"], "bullish")
+    # bearish
+    if prev_body > 0 and curr_body < 0 and curr["close"] <= prev["open"] and curr["open"] >= prev["close"]:
+        return (curr["close_time"], "bearish")
+    return None
+
+# ---------- Health HTTP server ----------
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/health"):
             uptime = int(time.time() - START_TIME)
+            content = f"OK - {BINANCE_SYMBOL} - uptime {uptime}s\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(f"OK - uptime {uptime}s\n".encode())
+            self.wfile.write(content.encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
 
     def log_message(self, format, *args):
-        # silence default logging
-        return
-
+        return  # silence
 
 class ThreadingTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
-
 def start_health_server_now():
     global HEALTH_SERVER
-    port_s = os.environ.get("PORT", "8000")
-    try:
-        port = int(port_s)
-    except Exception:
-        port = 8000
-    server = ThreadingTCPServer(("", port), HealthHandler)
+    server = ThreadingTCPServer(("", PORT), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     HEALTH_SERVER = server
-    print(f"[Health] server started and bound to port {port}")
+    print(f"[Health] server started on port {PORT}")
 
-
-# start early so Render sees the port quickly
+# Bind port ASAP so Render detects it
 start_health_server_now()
 
-
-# ---------------- Binance client helpers ----------------
-async def get_binance_client():
-    """Create or return a singleton AsyncClient for Binance."""
-    global BINANCE_CLIENT
-    if BINANCE_CLIENT is None:
-        BINANCE_CLIENT = await AsyncClient.create()
-    return BINANCE_CLIENT
-
-
-async def close_binance_client():
-    global BINANCE_CLIENT
-    if BINANCE_CLIENT:
-        try:
-            await BINANCE_CLIENT.close_connection()
-        except Exception:
-            pass
-        BINANCE_CLIENT = None
-
-
-def ticker_to_binance_symbol(ticker: str) -> str:
-    """
-    Convert a ticker like 'BTC-USD' or 'BTC/USD' to a Binance spot symbol 'BTCUSDT'.
-    If the ticker already looks like a Binance symbol, return as-is.
-    """
-    t = ticker.strip().upper()
-    # common mapping: -USD or /USD -> USDT
-    t = t.replace("/", "").replace("-", "")
-    if t.endswith("USD"):
-        t = t[:-3] + "USDT"
-    # If user already provided e.g. BTCUSDT, we return it
-    return t
-
-
-async def fetch_klines_binance(symbol: str, interval: str, lookback: str) -> pd.DataFrame:
-    """
-    Fetch historical klines using Binance AsyncClient.get_historical_klines.
-    lookback is a string acceptable to the Binance client, e.g. "2 day ago UTC" or "1 day ago UTC".
-    Returns a DataFrame with datetime index and columns Open, High, Low, Close, Volume.
-    If AsyncClient path fails, falls back to the REST /api/v3/klines via requests.
-    """
-    data = []
-    bin_sym = ticker_to_binance_symbol(symbol)
-    try:
-        client = await get_binance_client()
-        # Binance client accepts start_str like "2 day ago UTC"
-        klines = await client.get_historical_klines(bin_sym, interval, lookback)
-        if klines:
-            # columns: open_time, open, high, low, close, volume, close_time, ...
-            cols = ["OpenTime", "Open", "High", "Low", "Close", "Volume", "CloseTime",
-                    "QuoteAssetVolume", "NumTrades", "TakerBase", "TakerQuote", "Ignore"]
-            df = pd.DataFrame(klines, columns=cols)
-            df["OpenTime"] = pd.to_datetime(df["OpenTime"], unit="ms")
-            df.set_index("OpenTime", inplace=True)
-            # convert numeric fields
-            for c in ["Open", "High", "Low", "Close", "Volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            df.dropna(subset=["Close"], inplace=True)
-            return df[["Open", "High", "Low", "Close", "Volume"]]
-    except Exception as e:
-        print(f"[Binance async] failed to fetch {bin_sym} {interval} {lookback}: {e}")
-        traceback.print_exc()
-
-    # Fallback to REST endpoint
-    try:
-        print(f"[Binance fallback] using REST for {bin_sym} {interval}")
-        url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": bin_sym, "interval": interval, "limit": 1000}
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        klines = r.json()
-        if not klines:
-            return pd.DataFrame()
-        cols = ["OpenTime", "Open", "High", "Low", "Close", "Volume", "CloseTime",
-                "QuoteAssetVolume", "NumTrades", "TakerBase", "TakerQuote", "Ignore"]
-        df = pd.DataFrame(klines, columns=cols)
-        df["OpenTime"] = pd.to_datetime(df["OpenTime"], unit="ms")
-        df.set_index("OpenTime", inplace=True)
-        for c in ["Open", "High", "Low", "Close", "Volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df.dropna(subset=["Close"], inplace=True)
-        return df[["Open", "High", "Low", "Close", "Volume"]]
-    except Exception as e:
-        print(f"[Binance REST] fallback failed for {bin_sym}: {e}")
-        traceback.print_exc()
-        return pd.DataFrame()
-
-
-# ---------------- Technical indicators ----------------
-def calculate_macd(df: pd.DataFrame, fast: int = MACD_FAST, slow: int = MACD_SLOW, signal: int = MACD_SIGNAL) -> pd.DataFrame:
-    """Compute MACD and signal lines (works in-place and returns df). Expects column 'Close'."""
-    if df.empty:
-        return df
-    df["EMA_fast"] = df["Close"].ewm(span=fast, adjust=False).mean()
-    df["EMA_slow"] = df["Close"].ewm(span=slow, adjust=False).mean()
-    df["MACD"] = df["EMA_fast"] - df["EMA_slow"]
-    df["Signal"] = df["MACD"].ewm(span=signal, adjust=False).mean()
-    return df
-
-
-def detect_engulfing_list(df: pd.DataFrame) -> list:
-    """
-    Detect bullish and bearish engulfing candles.
-    Returns a list of tuples: (timestamp_index, "bullish"/"bearish").
-    Expects 'Open' and 'Close' columns.
-    """
-    engulfings = []
-    if df.empty or "Open" not in df.columns or "Close" not in df.columns:
-        return engulfings
-
-    for i in range(1, len(df)):
-        prev = df.iloc[i - 1]
-        curr = df.iloc[i]
-        try:
-            prev_open = float(prev["Open"])
-            prev_close = float(prev["Close"])
-            curr_open = float(curr["Open"])
-            curr_close = float(curr["Close"])
-        except Exception:
-            continue
-
-        prev_body = prev_close - prev_open
-        curr_body = curr_close - curr_open
-
-        # Bullish engulfing: previous red, current green and larger
-        if prev_body < 0 and curr_body > 0 and curr_close > prev_open and curr_open < prev_close:
-            engulfings.append((curr.name, "bullish"))
-        # Bearish engulfing: previous green, current red and larger
-        elif prev_body > 0 and curr_body < 0 and curr_close < prev_open and curr_open > prev_close:
-            engulfings.append((curr.name, "bearish"))
-
-    return engulfings
-
-
-# ---------------- Observers ----------------
+# ---------- Observers ----------
 async def macd_observer():
     """
-    Observes 15m MACD for zero-line and signal-line crosses.
-    Updates shared_state with the current bias and sends Discord alerts.
+    15m MACD watcher:
+      - signal cross alerts (bullish/bearish)
+      - zero-line cross alerts (bullish/bearish)
+      - updates shared_state['last_15m_macd_bias']
     """
-    last_alerted_status = {"fast_cross": None, "signal_cross": None}
-
+    session = requests.Session()
     while not STOP_EVENT.is_set():
         try:
-            # fetch 15m data for last ~2 days
-            df15 = await fetch_klines_binance(TICKER, "15m", "2 day ago UTC")
-            if len(df15) < 3:
-                print("[MACD] not enough 15m data; sleeping...") 
-                await asyncio.sleep(MACD_OBSERVER_SLEEP)
+            candles = binance_klines(BINANCE_SYMBOL, "15m", limit=240, session=session)
+            if len(candles) < max(MACD_SLOW, MACD_SIGNAL) + 2:
+                await asyncio.sleep(20)
                 continue
 
-            df15 = calculate_macd(df15)
-            prev = df15.iloc[-2]
-            curr = df15.iloc[-1]
+            closes = [c["close"] for c in candles]
+            macd_data = compute_macd(closes)
+            macd_series = macd_data["macd"]
+            signal_series = macd_data["signal"]
 
-            prev_macd = float(prev["MACD"])
-            curr_macd = float(curr["MACD"])
+            # Zero-line cross
+            zero = detect_zero_cross(macd_series)
+            if zero and zero != last_alerted["15m_fast_cross"]:
+                last_alerted["15m_fast_cross"] = zero
+                shared_state["last_15m_macd_bias"] = zero
+                direction = "ABOVE" if zero == "bullish" else "BELOW"
+                emoji = "🚀" if zero == "bullish" else "🔻"
+                ts = candles[-1]["close_time"]
+                send_discord_alert(f"{emoji} 15m MACD FAST crossed {direction} zero → {zero} bias at {fmt_ts(ts)}")
 
-            # Zero-line cross (fast line crossing zero)
-            current_fast_cross = None
-            if prev_macd <= 0 < curr_macd:
-                current_fast_cross = "bullish"
-            elif prev_macd >= 0 > curr_macd:
-                current_fast_cross = "bearish"
-
-            if current_fast_cross and current_fast_cross != last_alerted_status["fast_cross"]:
-                shared_state["last_15m_macd_bias"] = current_fast_cross
-                last_alerted_status["fast_cross"] = current_fast_cross
-                emoji = "🚀" if current_fast_cross == "bullish" else "🔻"
-                direction_msg = "ABOVE" if current_fast_cross == "bullish" else "BELOW"
-                send_discord_alert(f"{emoji} 15m MACD FAST crossed {direction_msg} zero → {current_fast_cross} bias")
-
-            # MACD line vs Signal line cross
-            prev_signal = float(prev["Signal"])
-            curr_signal = float(curr["Signal"])
-            current_signal_cross = None
-            if prev_macd <= prev_signal and curr_macd > curr_signal:
-                current_signal_cross = "bullish"
-            elif prev_macd >= prev_signal and curr_macd < curr_signal:
-                current_signal_cross = "bearish"
-
-            if current_signal_cross and current_signal_cross != last_alerted_status["signal_cross"]:
-                last_alerted_status["signal_cross"] = current_signal_cross
-                direction_msg = "ABOVE" if current_signal_cross == "bullish" else "BELOW"
-                send_discord_alert(f"⚡ 15m MACD crossed {direction_msg} signal → {current_signal_cross}")
+            # Signal cross
+            sig = detect_signal_cross(macd_series, signal_series)
+            if sig and sig != last_alerted["15m_signal_cross"]:
+                last_alerted["15m_signal_cross"] = sig
+                direction = "ABOVE" if sig == "bullish" else "BELOW"
+                ts = candles[-1]["close_time"]
+                send_discord_alert(f"⚡ 15m MACD crossed {direction} signal → {sig} at {fmt_ts(ts)}")
 
         except Exception as e:
             print("[MACD observer] error:", e)
             traceback.print_exc()
 
-        # sleep with frequent stop checks (total ~MACD_OBSERVER_SLEEP)
-        remaining = MACD_OBSERVER_SLEEP
-        while remaining > 0 and not STOP_EVENT.is_set():
-            await asyncio.sleep(min(10, remaining))
-            remaining -= min(10, remaining)
-
+        for _ in range(max(1, FETCH_INTERVAL // 5)):
+            if STOP_EVENT.is_set():
+                break
+            await asyncio.sleep(5)
 
 async def engulfing_observer():
     """
-    Observes 5m data for engulfing patterns and filters by 15m bias if enabled.
+    5m Engulfing watcher:
+      - Detects bullish/bearish engulfing on the last closed candle
+      - Optionally filters against last 15m MACD bias (ENGULFING_FILTER)
     """
-    last_alerted_engulfing_time = None
-
+    session = requests.Session()
     while not STOP_EVENT.is_set():
         try:
-            last_fast_bias = shared_state.get("last_15m_macd_bias")
-            df5 = await fetch_klines_binance(TICKER, "5m", "1 day ago UTC")
-            if len(df5) < 3:
-                print("[Engulfing] not enough 5m data; sleeping...")
-                await asyncio.sleep(ENGULFING_OBSERVER_SLEEP)
+            candles = binance_klines(BINANCE_SYMBOL, "5m", limit=300, session=session)
+            if len(candles) < 2:
+                await asyncio.sleep(20)
                 continue
 
-            engulfings = detect_engulfing_list(df5)
-
-            if engulfings:
-                # most recent engulfing
-                t, direction = engulfings[-1]
-                if t != last_alerted_engulfing_time:
-                    if ENGULFING_FILTER and last_fast_bias and direction != last_fast_bias:
-                        print(f"[Engulfing] skipping {direction} engulfing at {t} due to bias={last_fast_bias}")
+            eng = detect_engulfing(candles)
+            if eng:
+                t, direction = eng
+                if last_alerted["5m_engulfing_time"] != t:
+                    bias = shared_state.get("last_15m_macd_bias")
+                    if ENGULFING_FILTER and bias and direction != bias:
+                        print(f"[Engulfing] {fmt_ts(t)} {direction} skipped due to 15m bias {bias}")
                     else:
-                        try:
-                            timestr = t.strftime("%Y-%m-%d %H:%M")
-                        except Exception:
-                            timestr = str(t)
-                        send_discord_alert(f"🕯️ 5m ENGULFING CONFIRMED ({direction.upper()}) at {timestr}")
-                        last_alerted_engulfing_time = t
+                        send_discord_alert(f"🕯️ 5m ENGULFING CONFIRMED ({direction.upper()}) at {fmt_ts(t)}")
+                        last_alerted["5m_engulfing_time"] = t
 
         except Exception as e:
             print("[Engulfing observer] error:", e)
             traceback.print_exc()
 
-        remaining = ENGULFING_OBSERVER_SLEEP
-        while remaining > 0 and not STOP_EVENT.is_set():
-            await asyncio.sleep(min(10, remaining))
-            remaining -= min(10, remaining)
+        for _ in range(max(1, FETCH_INTERVAL // 5)):
+            if STOP_EVENT.is_set():
+                break
+            await asyncio.sleep(5)
 
-
-# ---------------- Graceful shutdown ----------------
+# ---------- graceful shutdown ----------
 def _signal_handler(signum, frame):
-    print(f"[Signal] received {signum}, initiating shutdown...")
+    print(f"[Signal] received {signum}, shutting down...")
     STOP_EVENT.set()
-    # shutdown health server quickly
     try:
         if HEALTH_SERVER:
             HEALTH_SERVER.shutdown()
@@ -351,51 +357,39 @@ def _signal_handler(signum, frame):
     except Exception:
         pass
 
-
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 
-
-# ---------------- Main ----------------
+# ---------- main ----------
 async def main():
-    print("Starting trading alert observers...")
-    send_discord_alert(f"✅ Bot started for {TICKER}.")
-
-    # Create binance client early (lazy inside fetch), but ensure it is created when needed.
+    send_discord_alert(f"✅ Bot started for {BINANCE_SYMBOL} (from TICKER={TICKER}).")
+    print(f"[Init] Monitoring {BINANCE_SYMBOL} | ENGULFING_FILTER={ENGULFING_FILTER} | FETCH_INTERVAL={FETCH_INTERVAL}s")
     tasks = [
         asyncio.create_task(macd_observer()),
         asyncio.create_task(engulfing_observer()),
     ]
-
     try:
-        await asyncio.gather(*tasks)
+        while not STOP_EVENT.is_set():
+            await asyncio.sleep(1)
     except asyncio.CancelledError:
         pass
-    except Exception as e:
-        print("[Main] exception:", e)
-        traceback.print_exc()
     finally:
-        print("[Main] shutting down observers and Binance client...")
+        print("[Main] cancelling observers...")
         STOP_EVENT.set()
         for t in tasks:
             t.cancel()
-        try:
-            await close_binance_client()
-        except Exception:
-            pass
         try:
             if HEALTH_SERVER:
                 HEALTH_SERVER.shutdown()
                 HEALTH_SERVER.server_close()
         except Exception:
             pass
-        print("[Main] stopped.")
-
+        print("[Main] exit.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except Exception as exc:
-        print("[Fatal] Unhandled exception:", exc)
+    except Exception as e:
+        print("[Fatal] unhandled:", e)
         traceback.print_exc()
         raise
