@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-CoinGecko-based trading alert bot (zero pandas/numpy/aiohttp).
+Yahoo Finance-based trading alert bot (zero Binance dependency).
 Features:
 - 15m MACD zero-line + signal-line cross alerts (updates bias)
 - 5m Engulfing detection (filtered by 15m bias if enabled)
 - Discord webhook alerts
 - Health HTTP server bound immediately so Render detects a port
 - Graceful shutdown on SIGINT/SIGTERM
-- Only dependency: requests
+- Only dependencies: requests, yfinance
 """
 
 import os
@@ -22,14 +22,14 @@ import datetime
 import math
 from typing import List, Dict, Optional, Tuple
 import requests
+import yfinance as yf
 
 # ---------------- CONFIG ----------------
 DISCORD_WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
     "https://discord.com/api/webhooks/1374711617127841922/U8kaZV_I_l1P6H6CFnBg6oWAFLnEUMLfiFpzq-DGM4GJrraRlYvHSHifboWqnYjkUYNR"
 )
-# Accept "BTC-USD" or CoinGecko IDs like "bitcoin"
-TICKER = os.environ.get("TICKER", "bitcoin").lower()
+TICKER = os.environ.get("TICKER", "BTC-USD").upper()
 MACD_FAST = int(os.environ.get("MACD_FAST", 8))
 MACD_SLOW = int(os.environ.get("MACD_SLOW", 15))
 MACD_SIGNAL = int(os.environ.get("MACD_SIGNAL", 9))
@@ -73,60 +73,45 @@ def send_discord_alert(message: str) -> None:
         print("[Discord] error sending message:", e)
 
 
-# ---------------- CoinGecko REST fetch ----------------
-def coingecko_ohlc(symbol: str, interval: str, max_retries: int = 3) -> List[Dict]:
+# ---------------- Yahoo Finance fetch ----------------
+def yf_klines(ticker: str, interval: str, limit: int = 500) -> List[Dict]:
     """
     Returns a list of dicts:
-      {open_time, close_time (datetime UTC), open, high, low, close, volume=0}
-    Only closed candles.
+      {open_time, close_time (datetime UTC), open, high, low, close, volume}
+    Only returns closed candles (filters out current open candle).
+    interval: "5m", "15m", etc.
     """
-    if interval == "5m":
-        days = 1  # last 24h
-    elif interval == "15m":
-        days = 7  # last 7d
-    else:
-        raise ValueError(f"Unsupported interval: {interval}")
+    interval_map = {"5m": "5m", "15m": "15m"}
+    if interval not in interval_map:
+        raise ValueError("Unsupported interval")
 
-    url = f"https://api.coingecko.com/api/v3/coins/{symbol.lower()}/ohlc"
-    params = {"vs_currency": "usd", "days": days}
-
-    sess = requests.Session()
-    now_ms = int(time.time() * 1000)
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = sess.get(url, params=params, timeout=10)
-            if resp.status_code != 200:
-                print(f"[CoinGecko] HTTP {resp.status_code}: {resp.text}")
-                time.sleep(1 + attempt)
+    try:
+        data = yf.download(
+            tickers=ticker,
+            period="7d",  # fetch last 7 days to cover all intervals
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+        )
+        out = []
+        now_ts = time.time()
+        for dt, row in data.iterrows():
+            ts = int(dt.timestamp())
+            if ts > now_ts:
                 continue
-            raw = resp.json()
-            if not isinstance(raw, list) or len(raw) == 0:
-                print("[CoinGecko] empty response; retrying")
-                time.sleep(1 + attempt)
-                continue
-            out = []
-            for row in raw:
-                ts_ms = int(row[0])
-                if ts_ms > now_ms - 1000:
-                    continue
-                close_time = datetime.datetime.utcfromtimestamp(ts_ms / 1000.0).replace(tzinfo=datetime.timezone.utc)
-                out.append({
-                    "open_time": close_time,
-                    "close_time": close_time,
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close": float(row[4]),
-                    "volume": 0.0,
-                })
-            if out:
-                return out
-            time.sleep(1 + attempt)
-        except Exception as e:
-            print(f"[CoinGecko] exception attempt {attempt}: {e}")
-            time.sleep(1 + attempt)
-    return []
+            out.append({
+                "open_time": dt.to_pydatetime().replace(tzinfo=datetime.timezone.utc),
+                "close_time": dt.to_pydatetime().replace(tzinfo=datetime.timezone.utc),
+                "open": float(row["Open"]),
+                "high": float(row["High"]),
+                "low": float(row["Low"]),
+                "close": float(row["Close"]),
+                "volume": float(row["Volume"])
+            })
+        return out[-limit:]
+    except Exception as e:
+        print("[YahooFinance] error fetching data:", e)
+        return []
 
 
 # ---------------- Math helpers (EMA/MACD) ----------------
@@ -153,7 +138,9 @@ def compute_macd(closes: List[float]) -> Dict[str, List[float]]:
         macd.append((f - s) if (not math.isnan(f) and not math.isnan(s)) else math.nan)
     macd_for_signal = [0.0 if math.isnan(x) else x for x in macd]
     signal = ema_list(macd_for_signal, MACD_SIGNAL)
-    hist = [(m - s) if (not math.isnan(m) and not math.isnan(s)) else math.nan for m, s in zip(macd, signal)]
+    hist = []
+    for m, s in zip(macd, signal):
+        hist.append((m - s) if (not math.isnan(m) and not math.isnan(s)) else math.nan)
     return {"macd": macd, "signal": signal, "hist": hist}
 
 
@@ -202,7 +189,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(f"OK - {TICKER.upper()} - uptime {uptime}s\n".encode())
+            self.wfile.write(f"OK - {TICKER} - uptime {uptime}s\n".encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -231,7 +218,7 @@ start_health_server_now()
 async def macd_observer():
     while not STOP_EVENT.is_set():
         try:
-            candles = coingecko_ohlc(TICKER, "15m")
+            candles = yf_klines(TICKER, "15m", limit=500)
             if len(candles) < max(MACD_SLOW + 2, 10):
                 await asyncio.sleep(10)
                 continue
@@ -269,7 +256,7 @@ async def macd_observer():
 async def engulfing_observer():
     while not STOP_EVENT.is_set():
         try:
-            candles = coingecko_ohlc(TICKER, "5m")
+            candles = yf_klines(TICKER, "5m", limit=500)
             if len(candles) < 2:
                 await asyncio.sleep(10)
                 continue
@@ -311,8 +298,8 @@ signal.signal(signal.SIGTERM, _signal_handler)
 
 # ---------------- main ----------------
 async def main():
-    print(f"[Init] Monitoring {TICKER.upper()} | ENGULFING_FILTER={ENGULFING_FILTER} | FETCH_INTERVAL={FETCH_INTERVAL}s")
-    send_discord_alert(f"✅ Bot started for {TICKER.upper()}.")
+    print(f"[Init] Monitoring {TICKER} | ENGULFING_FILTER={ENGULFING_FILTER} | FETCH_INTERVAL={FETCH_INTERVAL}s")
+    send_discord_alert(f"✅ Bot started for {TICKER}.")
     tasks = [asyncio.create_task(macd_observer()), asyncio.create_task(engulfing_observer())]
     try:
         while not STOP_EVENT.is_set():
