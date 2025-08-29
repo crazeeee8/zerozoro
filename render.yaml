@@ -2,5 +2,8 @@ services:
   - type: web
     name: macd-discord-alert-bot
     env: python
+    build:
+      pythonVersion: 3.11.9
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
+
