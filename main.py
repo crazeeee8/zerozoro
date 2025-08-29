@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Yahoo Finance-based trading alert bot (zero Binance dependency).
-Features:
-- 15m MACD zero-line + signal-line cross alerts (updates bias)
-- 5m Engulfing detection (filtered by 15m bias if enabled)
+Sniper-level implementation:
+- 15m MACD zero-line cross alerts
+- 5m Engulfing detection triggered only after MACD zero-cross
+- Exact candle close alignment
+- Minimal API calls + retry/backoff
 - Discord webhook alerts
-- Health HTTP server bound immediately so Render detects a port
-- Graceful shutdown on SIGINT/SIGTERM
-- Only dependencies: requests, yfinance
+- Health HTTP server
+- Graceful shutdown
 """
 
 import os
@@ -27,28 +28,28 @@ import yfinance as yf
 # ---------------- CONFIG ----------------
 DISCORD_WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
-    "https://discord.com/api/webhooks/1374711617127841922/U8kaZV_I_l1P6H6CFnBg6oWAFLnEUMLfiFpzq-DGM4GJrraRlYvHSHifboWqnYjkUYNR"
+    "https://discord.com/api/webhooks/EXAMPLE"
 )
 TICKER = os.environ.get("TICKER", "BTC-USD").upper()
 MACD_FAST = int(os.environ.get("MACD_FAST", 8))
 MACD_SLOW = int(os.environ.get("MACD_SLOW", 15))
 MACD_SIGNAL = int(os.environ.get("MACD_SIGNAL", 9))
 ENGULFING_FILTER = os.environ.get("ENGULFING_FILTER", "True").lower() in ("1", "true", "yes")
-FETCH_INTERVAL = int(os.environ.get("FETCH_INTERVAL", 60))  # seconds between checks
 PORT = int(os.environ.get("PORT", "8000"))
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds
 # ----------------------------------------
 
 START_TIME = time.time()
 STOP_EVENT = threading.Event()
 HEALTH_SERVER = None
 
-# dedupe
+# State
 last_alerted = {
     "15m_fast_cross": None,
-    "15m_signal_cross": None,
     "5m_engulfing_time": None,
 }
-shared_state = {"last_15m_macd_bias": None}
+shared_state = {"last_15m_macd_bias": None, "engulfing_active": False}
 
 
 def now_utc() -> datetime.datetime:
@@ -74,44 +75,35 @@ def send_discord_alert(message: str) -> None:
 
 
 # ---------------- Yahoo Finance fetch ----------------
-def yf_klines(ticker: str, interval: str, limit: int = 500) -> List[Dict]:
-    """
-    Returns a list of dicts:
-      {open_time, close_time (datetime UTC), open, high, low, close, volume}
-    Only returns closed candles (filters out current open candle).
-    interval: "5m", "15m", etc.
-    """
-    interval_map = {"5m": "5m", "15m": "15m"}
-    if interval not in interval_map:
-        raise ValueError("Unsupported interval")
-
-    try:
-        data = yf.download(
-            tickers=ticker,
-            period="7d",  # fetch last 7 days to cover all intervals
-            interval=interval,
-            progress=False,
-            auto_adjust=False,
-        )
-        out = []
-        now_ts = time.time()
-        for dt, row in data.iterrows():
-            ts = int(dt.timestamp())
-            if ts > now_ts:
-                continue
-            out.append({
+def yf_latest_candle(ticker: str, interval: str) -> Optional[Dict]:
+    """Fetch only the last closed candle with retry/backoff."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            data = yf.download(
+                tickers=ticker,
+                period="2d",  # minimal period
+                interval=interval,
+                progress=False,
+                auto_adjust=False,
+            )
+            if data.empty:
+                raise ValueError("No data returned")
+            dt = data.index[-2]  # last closed candle
+            row = data.iloc[-2]
+            candle = {
                 "open_time": dt.to_pydatetime().replace(tzinfo=datetime.timezone.utc),
                 "close_time": dt.to_pydatetime().replace(tzinfo=datetime.timezone.utc),
                 "open": float(row["Open"]),
                 "high": float(row["High"]),
                 "low": float(row["Low"]),
                 "close": float(row["Close"]),
-                "volume": float(row["Volume"])
-            })
-        return out[-limit:]
-    except Exception as e:
-        print("[YahooFinance] error fetching data:", e)
-        return []
+                "volume": float(row["Volume"]),
+            }
+            return candle
+        except Exception as e:
+            print(f"[YahooFinance] attempt {attempt+1} error: {e}")
+            time.sleep(RETRY_DELAY)
+    return None
 
 
 # ---------------- Math helpers (EMA/MACD) ----------------
@@ -138,9 +130,7 @@ def compute_macd(closes: List[float]) -> Dict[str, List[float]]:
         macd.append((f - s) if (not math.isnan(f) and not math.isnan(s)) else math.nan)
     macd_for_signal = [0.0 if math.isnan(x) else x for x in macd]
     signal = ema_list(macd_for_signal, MACD_SIGNAL)
-    hist = []
-    for m, s in zip(macd, signal):
-        hist.append((m - s) if (not math.isnan(m) and not math.isnan(s)) else math.nan)
+    hist = [m - s for m, s in zip(macd, signal)]
     return {"macd": macd, "signal": signal, "hist": hist}
 
 
@@ -155,29 +145,13 @@ def detect_zero_cross(macd: List[float]) -> Optional[str]:
     return None
 
 
-def detect_signal_cross(macd: List[float], signal: List[float]) -> Optional[str]:
-    if len(macd) < 2 or len(signal) < 2:
-        return None
-    if macd[-2] <= signal[-2] and macd[-1] > signal[-1]:
-        return "bullish"
-    if macd[-2] >= signal[-2] and macd[-1] < signal[-1]:
-        return "bearish"
-    return None
-
-
-def detect_engulfing(candles: List[Dict]) -> Optional[Tuple[datetime.datetime, str]]:
-    if len(candles) < 2:
-        return None
-    prev = candles[-2]
-    curr = candles[-1]
+def detect_engulfing(prev: Dict, curr: Dict) -> Optional[str]:
     prev_body = prev["close"] - prev["open"]
     curr_body = curr["close"] - curr["open"]
-    # bullish
     if prev_body < 0 and curr_body > 0 and curr["close"] >= prev["open"] and curr["open"] <= prev["close"]:
-        return (curr["close_time"], "bullish")
-    # bearish
+        return "bullish"
     if prev_body > 0 and curr_body < 0 and curr["close"] <= prev["open"] and curr["open"] >= prev["close"]:
-        return (curr["close_time"], "bearish")
+        return "bearish"
     return None
 
 
@@ -189,7 +163,12 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(f"OK - {TICKER} - uptime {uptime}s\n".encode())
+            msg = (
+                f"OK - {TICKER} - uptime {uptime}s\n"
+                f"Last 15m MACD cross: {last_alerted['15m_fast_cross']}\n"
+                f"Engulfing active: {shared_state['engulfing_active']}\n"
+            )
+            self.wfile.write(msg.encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -214,70 +193,73 @@ def start_health_server_now():
 start_health_server_now()
 
 
+# ---------------- Helpers ----------------
+def sleep_until_next_close(interval_minutes: int):
+    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+    next_minute = (now.minute // interval_minutes + 1) * interval_minutes
+    next_hour = now.hour + (next_minute // 60)
+    next_minute %= 60
+    next_close = now.replace(hour=next_hour % 24, minute=next_minute, second=0, microsecond=0)
+    delta = (next_close - now).total_seconds()
+    if delta > 0:
+        time.sleep(delta)
+
+
 # ---------------- Observers ----------------
 async def macd_observer():
     while not STOP_EVENT.is_set():
-        try:
-            candles = yf_klines(TICKER, "15m", limit=500)
-            if len(candles) < max(MACD_SLOW + 2, 10):
-                await asyncio.sleep(10)
-                continue
-            closes = [c["close"] for c in candles]
-            macd_data = compute_macd(closes)
-            macd_series = macd_data["macd"]
-            signal_series = macd_data["signal"]
+        sleep_until_next_close(15)
+        candle = yf_latest_candle(TICKER, "15m")
+        if not candle:
+            continue
 
-            zero = detect_zero_cross(macd_series)
-            if zero and zero != last_alerted["15m_fast_cross"]:
-                last_alerted["15m_fast_cross"] = zero
-                shared_state["last_15m_macd_bias"] = zero
-                emoji = "🚀" if zero == "bullish" else "🔻"
-                dir_msg = "ABOVE" if zero == "bullish" else "BELOW"
-                ts = candles[-1]["close_time"]
-                send_discord_alert(f"{emoji} 15m MACD FAST crossed {dir_msg} zero → {zero} bias at {fmt_ts(ts)}")
+        # Maintain last 15m close prices for MACD
+        if "closes" not in shared_state:
+            shared_state["closes"] = []
+        shared_state["closes"].append(candle["close"])
+        shared_state["closes"] = shared_state["closes"][-(MACD_SLOW + 5):]
 
-            sig = detect_signal_cross(macd_series, signal_series)
-            if sig and sig != last_alerted["15m_signal_cross"]:
-                last_alerted["15m_signal_cross"] = sig
-                dir_msg = "ABOVE" if sig == "bullish" else "BELOW"
-                ts = candles[-1]["close_time"]
-                send_discord_alert(f"⚡ 15m MACD crossed {dir_msg} signal → {sig} at {fmt_ts(ts)}")
+        macd_data = compute_macd(shared_state["closes"])
+        macd_series = macd_data["macd"]
 
-        except Exception as e:
-            print("[MACD observer] error:", e)
-            traceback.print_exc()
+        zero = detect_zero_cross(macd_series)
+        if zero and zero != last_alerted["15m_fast_cross"]:
+            last_alerted["15m_fast_cross"] = zero
+            shared_state["last_15m_macd_bias"] = zero
+            shared_state["engulfing_active"] = True  # Activate 5m observer
+            emoji = "🚀" if zero == "bullish" else "🔻"
+            dir_msg = "ABOVE" if zero == "bullish" else "BELOW"
+            send_discord_alert(f"{emoji} 15m MACD FAST crossed {dir_msg} zero → {zero} bias at {fmt_ts(candle['close_time'])}")
 
-        for _ in range(max(1, FETCH_INTERVAL // 5)):
-            if STOP_EVENT.is_set():
-                break
-            await asyncio.sleep(5)
+        await asyncio.sleep(1)
 
 
 async def engulfing_observer():
+    prev_candle = None
     while not STOP_EVENT.is_set():
-        try:
-            candles = yf_klines(TICKER, "5m", limit=500)
-            if len(candles) < 2:
-                await asyncio.sleep(10)
-                continue
-            eng = detect_engulfing(candles)
-            if eng:
-                t, direction = eng
-                if last_alerted["5m_engulfing_time"] != t:
-                    bias = shared_state.get("last_15m_macd_bias")
-                    if ENGULFING_FILTER and bias and direction != bias:
-                        print(f"[Engulfing] {fmt_ts(t)} {direction} skipped due to bias {bias}")
-                    else:
-                        send_discord_alert(f"🕯️ 5m ENGULFING CONFIRMED ({direction.upper()}) at {fmt_ts(t)}")
-                        last_alerted["5m_engulfing_time"] = t
-        except Exception as e:
-            print("[Engulfing observer] error:", e)
-            traceback.print_exc()
-
-        for _ in range(max(1, FETCH_INTERVAL // 5)):
-            if STOP_EVENT.is_set():
-                break
+        if not shared_state.get("engulfing_active"):
             await asyncio.sleep(5)
+            continue
+
+        sleep_until_next_close(5)
+        curr_candle = yf_latest_candle(TICKER, "5m")
+        if not curr_candle:
+            continue
+
+        if prev_candle:
+            direction = detect_engulfing(prev_candle, curr_candle)
+            if direction and last_alerted["5m_engulfing_time"] != curr_candle["close_time"]:
+                bias = shared_state.get("last_15m_macd_bias")
+                if ENGULFING_FILTER and bias and direction != bias:
+                    print(f"[Engulfing] {fmt_ts(curr_candle['close_time'])} {direction} skipped due to bias {bias}")
+                else:
+                    send_discord_alert(f"🕯️ 5m ENGULFING CONFIRMED ({direction.upper()}) at {fmt_ts(curr_candle['close_time'])}")
+                    last_alerted["5m_engulfing_time"] = curr_candle["close_time"]
+                    # Reset engulfing state after first detection
+                    shared_state["engulfing_active"] = False
+
+        prev_candle = curr_candle
+        await asyncio.sleep(1)
 
 
 # ---------------- graceful shutdown ----------------
@@ -298,7 +280,7 @@ signal.signal(signal.SIGTERM, _signal_handler)
 
 # ---------------- main ----------------
 async def main():
-    print(f"[Init] Monitoring {TICKER} | ENGULFING_FILTER={ENGULFING_FILTER} | FETCH_INTERVAL={FETCH_INTERVAL}s")
+    print(f"[Init] Monitoring {TICKER} | ENGULFING_FILTER={ENGULFING_FILTER}")
     send_discord_alert(f"✅ Bot started for {TICKER}.")
     tasks = [asyncio.create_task(macd_observer()), asyncio.create_task(engulfing_observer())]
     try:
