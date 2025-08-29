@@ -1,6 +1,7 @@
 python-binance==1.0.16
-pandas==2.3.2
-numpy<2.0
-requests==2.32.5
-aiohttp==3.8.5
-
+pandas==2.2.2
+numpy==1.26.4
+requests==2.32.3
+aiohttp==3.9.5
+websockets==11.0.3
+dateparser==1.2.0
