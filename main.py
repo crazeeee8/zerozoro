@@ -1,168 +1,167 @@
 import asyncio
-import yfinance as yf
+import ccxt
+import finnhub
 import pandas as pd
 import numpy as np
+from datetime import datetime, timezone, timedelta
 import logging
-import signal
-import sys
+import os
 import aiohttp
-import time
-from datetime import datetime, timedelta
 from aiohttp import web
-from pandas_datareader import data as pdr
 
 # ------------------------------
 # Logging Setup
 # ------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ------------------------------
 # Config
 # ------------------------------
-TICKER = "BTC-USD"
-INTERVAL = "1h"
-LOOKBACK = 100
-DISCORD_WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK"
+SYMBOL = "BTC/USDT"
+INTERVAL = "15m"
+LOOKBACK = 50
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+
+# Finnhub client (fallback)
+finnhub_client = finnhub.Client(api_key=os.getenv("FINNHUB_API_KEY"))
+
+# Binance via CCXT
+exchange = ccxt.binance()
 
 # ------------------------------
-# Global State
+# Technical Indicators
 # ------------------------------
-shutdown_flag = False
-last_macd_signal = None
-last_check_time = None
+def ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
+
+def macd(df, fast=8, slow=15, signal=9):
+    df["ema_fast"] = ema(df["close"], fast)
+    df["ema_slow"] = ema(df["close"], slow)
+    df["macd"] = df["ema_fast"] - df["ema_slow"]
+    df["signal"] = ema(df["macd"], signal)
+    return df
+
+def detect_engulfing(df):
+    signals = []
+    for i in range(1, len(df)):
+        prev = df.iloc[i-1]
+        curr = df.iloc[i]
+        if curr["close"] > curr["open"] and prev["close"] < prev["open"]:
+            if curr["close"] > prev["open"] and curr["open"] < prev["close"]:
+                signals.append("bullish_engulfing")
+        elif curr["close"] < curr["open"] and prev["close"] > prev["open"]:
+            if curr["close"] < prev["open"] and curr["open"] > prev["close"]:
+                signals.append("bearish_engulfing")
+        else:
+            signals.append(None)
+    df["engulfing"] = [None] + signals
+    return df
 
 # ------------------------------
-# Graceful Shutdown
+# Data Fetching
 # ------------------------------
-def handle_shutdown(signum, frame):
-    global shutdown_flag
-    logging.info("Shutdown signal received")
-    shutdown_flag = True
-
-signal.signal(signal.SIGINT, handle_shutdown)
-signal.signal(signal.SIGTERM, handle_shutdown)
-
-# ------------------------------
-# Dual-Source Price Fetcher
-# ------------------------------
-def get_price_data(ticker=TICKER, period="1mo", interval=INTERVAL):
+async def fetch_binance():
+    """Fetch candles from Binance using CCXT"""
     try:
-        logging.info("Fetching data via yfinance...")
-        df = yf.download(ticker, period=period, interval=interval, progress=False)
-        if df is None or df.empty:
-            raise ValueError("Empty dataframe from yfinance")
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, INTERVAL, limit=LOOKBACK)
+        df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
+        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+        df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
         return df
     except Exception as e:
-        logging.warning(f"yfinance failed: {e}. Trying pandas_datareader...")
-        try:
-            end = datetime.now()
-            start = end - timedelta(days=30)
-            df = pdr.get_data_yahoo(ticker, start=start, end=end)
-            if df is None or df.empty:
-                raise ValueError("Empty dataframe from pandas_datareader")
-            df = df.rename(columns={
-                "Open": "Open",
-                "High": "High",
-                "Low": "Low",
-                "Close": "Close",
-                "Volume": "Volume"
-            })
-            return df
-        except Exception as e2:
-            logging.error(f"pandas_datareader also failed: {e2}")
-            return None
+        logging.error(f"Binance fetch failed: {e}")
+        return None
 
-# ------------------------------
-# Indicators
-# ------------------------------
-def calculate_macd(df, fast=12, slow=26, signal=9):
-    df["EMA_fast"] = df["Close"].ewm(span=fast, adjust=False).mean()
-    df["EMA_slow"] = df["Close"].ewm(span=slow, adjust=False).mean()
-    df["MACD"] = df["EMA_fast"] - df["EMA_slow"]
-    df["Signal"] = df["MACD"].ewm(span=signal, adjust=False).mean()
+async def fetch_finnhub():
+    """Fallback: fetch candles from Finnhub"""
+    try:
+        now = int(datetime.now(timezone.utc).timestamp())
+        frm = now - LOOKBACK * 15 * 60
+        res = finnhub_client.crypto_candles("BINANCE:BTCUSDT", "15", frm, now)
+        if res.get("s") != "ok":
+            return None
+        df = pd.DataFrame({
+            "time": pd.to_datetime(res["t"], unit="s", utc=True),
+            "open": res["o"], "high": res["h"], "low": res["l"], "close": res["c"], "volume": res["v"]
+        })
+        df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
+        return df
+    except Exception as e:
+        logging.error(f"Finnhub fetch failed: {e}")
+        return None
+
+async def get_data():
+    df = await fetch_binance()
+    if df is None:
+        df = await fetch_finnhub()
     return df
 
 # ------------------------------
 # Alerts
 # ------------------------------
-async def send_discord_alert(message: str):
-    try:
-        async with aiohttp.ClientSession() as session:
-            webhook = {"content": message}
-            async with session.post(DISCORD_WEBHOOK_URL, json=webhook) as resp:
-                if resp.status != 204:
-                    logging.error(f"Discord webhook failed: {resp.status}")
-    except Exception as e:
-        logging.error(f"Failed to send Discord alert: {e}")
+async def send_discord(message):
+    if not DISCORD_WEBHOOK:
+        return
+    async with aiohttp.ClientSession() as session:
+        try:
+            await session.post(DISCORD_WEBHOOK, json={"content": message})
+        except Exception as e:
+            logging.error(f"Discord send failed: {e}")
 
 # ------------------------------
-# Core Logic
+# Observer
 # ------------------------------
-async def monitor():
-    global last_macd_signal, last_check_time
-    backoff = 5
+async def analyze():
+    df = await get_data()
+    if df is None or len(df) < LOOKBACK:
+        logging.warning("Not enough data.")
+        return
 
-    while not shutdown_flag:
-        df = get_price_data()
+    df = macd(df)
+    df = detect_engulfing(df)
+    last = df.iloc[-1]
 
-        if df is None or df.empty:
-            logging.warning(f"No data fetched. Retrying in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 300)
-            continue
+    msg = []
+    if last["macd"] > last["signal"]:
+        msg.append("MACD bullish")
+    elif last["macd"] < last["signal"]:
+        msg.append("MACD bearish")
 
-        backoff = 5  # reset backoff if successful
-        df = calculate_macd(df)
+    if last["engulfing"] == "bullish_engulfing":
+        msg.append("Bullish engulfing")
+    elif last["engulfing"] == "bearish_engulfing":
+        msg.append("Bearish engulfing")
 
-        last_row = df.iloc[-1]
-        prev_row = df.iloc[-2]
-        now = datetime.utcnow()
-
-        # Ensure timestamp-based detection
-        if last_check_time is None or last_row.name > last_check_time:
-            # MACD cross detection
-            if prev_row["MACD"] <= prev_row["Signal"] and last_row["MACD"] > last_row["Signal"]:
-                if last_macd_signal != "bullish":
-                    msg = f"🚀 Bullish MACD cross detected at {now}"
-                    logging.info(msg)
-                    await send_discord_alert(msg)
-                    last_macd_signal = "bullish"
-
-            elif prev_row["MACD"] >= prev_row["Signal"] and last_row["MACD"] < last_row["Signal"]:
-                if last_macd_signal != "bearish":
-                    msg = f"🔻 Bearish MACD cross detected at {now}"
-                    logging.info(msg)
-                    await send_discord_alert(msg)
-                    last_macd_signal = "bearish"
-
-            last_check_time = last_row.name
-
-        await asyncio.sleep(60)
+    if msg:
+        message = f"Signal @ {last['time']}: {', '.join(msg)}"
+        logging.info(message)
+        await send_discord(message)
 
 # ------------------------------
-# Health Server
+# Healthcheck Server
 # ------------------------------
 async def health(request):
     return web.Response(text="OK")
 
 async def start_server():
     app = web.Application()
-    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
 
 # ------------------------------
-# Main
+# Main Loop
 # ------------------------------
 async def main():
     await start_server()
-    await monitor()
+    while True:
+        try:
+            await analyze()
+        except Exception as e:
+            logging.error(f"Main loop error: {e}")
+        await asyncio.sleep(60)  # 1 call per min
 
 if __name__ == "__main__":
     asyncio.run(main())
