@@ -24,7 +24,7 @@ DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1374711617127841922/U8kaZV_I
 
 FAST, SLOW, SIGNAL = 8, 15, 9
 
-CHECK_DELAY = 60  # seconds between checks
+CHECK_DELAY = 60 # seconds between checks
 
 
 
@@ -145,3 +145,4 @@ while True:
 
 
     time.sleep(CHECK_DELAY)
+
