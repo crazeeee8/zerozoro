@@ -23,7 +23,8 @@ LOOKBACK = 50
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
 # Finnhub client (fallback)
-finnhub_client = finnhub.Client(api_key=os.getenv("FINNHUB_API_KEY"))
+finnhub_client = finnhub.Client(api_key="your_actual_api_key_here")
+
 
 # Binance via CCXT
 exchange = ccxt.binance()
@@ -165,3 +166,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
