@@ -3,11 +3,6 @@ pandas==2.2.2
 numpy==1.26.4
 requests==2.32.3
 aiohttp==3.9.5
-dateparser==1.2.0
-pandas_datareader
-ccxt
-
 pandas-ta==0.3.14b0
-
-
-
+yfinance
+Flask
