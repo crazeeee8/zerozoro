@@ -6,3 +6,4 @@ aiohttp==3.9.5
 pandas-ta==0.3.14b0
 yfinance
 Flask
+ccxt
