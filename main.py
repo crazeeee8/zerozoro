@@ -8,10 +8,13 @@ import threading
 
 # === CONFIG ===
 TICKER = "BTC-USD"
-INTERVAL = "15m"
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1374711617127841922/U8kaZV_I_l1P6H6CFnBg6oWAFLnEUMLfiFpzq-DGM4GJrraRlYvHSHifboWqnYjkUYNR"
+
 FAST, SLOW, SIGNAL = 8, 15, 9
-CHECK_DELAY = 60 # seconds between checks
+CHECK_DELAY = 60  # seconds between checks
+
+# Monitor these timeframes
+TIMEFRAMES = ["5m", "15m"]
 
 # === FLASK KEEP-ALIVE SERVER ===
 app = Flask("")
@@ -33,12 +36,12 @@ def send_alert(message: str):
         print("Discord error:", e)
 
 def send_startup_ping():
-    msg = f"✅ Bot started and is monitoring {TICKER} ({INTERVAL}) — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    msg = f"✅ Bot started and is monitoring {TICKER} on {', '.join(TIMEFRAMES)} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     print(msg)
     send_alert(msg)
 
-def get_data():
-    df = yf.download(tickers=TICKER, interval=INTERVAL, period="2d")
+def get_data(interval: str):
+    df = yf.download(tickers=TICKER, interval=interval, period="2d")
     df.dropna(inplace=True)
     return df
 
@@ -50,24 +53,27 @@ def macd(df, fast=FAST, slow=SLOW, signal=SIGNAL):
     return df
 
 # === MAIN LOOP ===
-last_state = None
-print("🔄 Bot started... monitoring MACD zero-cross on", TICKER)
+last_states = {tf: None for tf in TIMEFRAMES}
+
+print("🔄 Bot started... monitoring MACD zero-cross on", TICKER, "for", TIMEFRAMES)
 send_startup_ping()
 
 while True:
     try:
-        df = get_data()
-        df = macd(df)
-        macd_val = df["macd"].iloc[-1]
+        for tf in TIMEFRAMES:
+            df = get_data(tf)
+            df = macd(df)
 
-        state = "above" if macd_val > 0 else "below"
+            macd_val = df["macd"].iloc[-1]
+            state = "above" if macd_val > 0 else "below"
 
-        if last_state and last_state != state:
-            msg = f"⚡ MACD crossed {state.upper()} zero on {TICKER} ({INTERVAL}) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            print(msg)
-            send_alert(msg)
+            if last_states[tf] and last_states[tf] != state:
+                msg = f"[{tf}] ⚡ MACD crossed {state.upper()} zero on {TICKER} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                print(msg)
+                send_alert(msg)
 
-        last_state = state
+            last_states[tf] = state
+
     except Exception as e:
         print("Error:", e)
 
