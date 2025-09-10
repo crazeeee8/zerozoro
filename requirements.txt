@@ -1,10 +1,9 @@
+ccxt
 websockets
 pandas==2.2.2
 numpy==1.26.4
 requests==2.32.3
 aiohttp==3.9.5
-pandas-ta==0.3.14b0
-yfinance
-Flask
-ccxt
-
+yfinance==0.2.40
+git+https://github.com/twopirllc/pandas-ta.git
+flask==3.0.3
