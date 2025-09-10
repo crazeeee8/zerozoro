@@ -5,5 +5,7 @@ numpy==1.26.4
 requests==2.32.3
 aiohttp==3.9.5
 yfinance==0.2.40
-git+https://github.com/twopirllc/pandas-ta.git
+https://github.com/twopirllc/pandas-ta/archive/refs/heads/main.zip
 flask==3.0.3
+
+
